@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="580" viewBox="0 0 1040 580" role="img" aria-labelledby="title description">
+  <title id="title">Zed Agent Overlay illustrative preview</title>
+  <desc id="description">Made-up agent threads demonstrate color tags and working, waiting, and finished rings. A pinned prompt shows the current request and usage. A Needs you window extracts an agent's question.</desc>
+  <rect width="1040" height="580" rx="14" fill="#1f2430"/>
+  <g font-family="Segoe UI, Arial, sans-serif">
+    <rect x="1" y="1" width="1038" height="42" rx="14" fill="#272d38"/>
+    <text x="22" y="28" font-size="15" fill="#cccac2">Zed + Agent Overlay</text>
+    <text x="800" y="27" font-size="12" fill="#a6acb9">ILLUSTRATION / SAMPLE DATA</text>
+    <path d="M280 43V579M0 43H1040" stroke="#3b4252"/>
+    <text x="24" y="78" font-size="14" fill="#cccac2">Threads</text>
+    <circle cx="245" cy="73" r="6" fill="none" stroke="#a6acb9" stroke-width="2"/>
+    <path d="M250 78l5 5" stroke="#a6acb9" stroke-width="2"/>
+    <text x="24" y="116" font-size="12" fill="#a6acb9">website</text>
+    <rect x="14" y="134" width="252" height="57" rx="8" fill="#272d38" stroke="#72cffe" stroke-width="2"/>
+    <rect x="20" y="144" width="5" height="37" rx="2" fill="#debffe"/>
+    <text x="37" y="158" font-size="14" fill="#cccac2">Improve the landing page</text>
+    <text x="37" y="178" font-size="11" fill="#72cffe">Claude / Working</text>
+    <rect x="14" y="202" width="252" height="57" rx="8" fill="none" stroke="#ffcc66" stroke-width="2"/>
+    <rect x="20" y="212" width="5" height="37" rx="2" fill="#95e5cb"/>
+    <text x="37" y="226" font-size="14" fill="#cccac2">Choose a deployment target</text>
+    <text x="37" y="246" font-size="11" fill="#ffcc66">Codex / Needs your answer</text>
+    <text x="24" y="299" font-size="12" fill="#a6acb9">tools</text>
+    <rect x="14" y="317" width="252" height="57" rx="8" fill="none" stroke="#d5ff80" stroke-width="2"/>
+    <rect x="20" y="327" width="5" height="37" rx="2" fill="#fead66"/>
+    <text x="37" y="341" font-size="14" fill="#cccac2">Clean up the export script</text>
+    <text x="37" y="361" font-size="11" fill="#d5ff80">Copilot / Finished since you looked</text>
+    <text x="24" y="453" font-size="12" fill="#a6acb9">Your colors stay until you change them.</text>
+    <text x="24" y="480" font-size="12" fill="#72cffe">Blue: working</text>
+    <text x="24" y="503" font-size="12" fill="#ffcc66">Amber: waiting on you</text>
+    <text x="24" y="526" font-size="12" fill="#d5ff80">Green: newly finished</text>
+    <text x="302" y="76" font-size="14" fill="#cccac2">Improve the landing page</text>
+    <rect x="300" y="93" width="716" height="89" rx="6" fill="#272d38" stroke="#3b4252"/>
+    <text x="315" y="116" font-size="11" fill="#72cffe">Read 4 files / edited 2 files</text>
+    <text x="315" y="148" font-size="14" fill="#cccac2">Make the pricing section easier to compare on mobile.</text>
+    <text x="315" y="170" font-size="11" fill="#a6acb9">Your last prompt / click to expand / right-click to copy</text>
+    <rect x="690" y="102" width="157" height="24" rx="4" fill="#1f2430"/>
+    <text x="702" y="118" font-size="11" fill="#72cffe">Working 3m 12s</text>
+    <rect x="858" y="102" width="145" height="24" rx="4" fill="#1f2430"/>
+    <text x="870" y="118" font-size="11" fill="#a6acb9">This thread: 850K tok</text>
+    <text x="317" y="224" font-size="13" fill="#a6acb9">Agent conversation stays in Zed.</text>
+    <text x="317" y="254" font-size="13" fill="#cccac2">I updated the layout and am checking the mobile styles.</text>
+    <rect x="459" y="294" width="542" height="252" rx="10" fill="#191e28" stroke="#3b4252"/>
+    <text x="480" y="325" font-size="16" fill="#cccac2">Needs you</text>
+    <text x="480" y="351" font-size="12" fill="#a6acb9">Finished replies that ask you for something</text>
+    <path d="M480 365H980" stroke="#3b4252"/>
+    <text x="480" y="394" font-size="14" fill="#cccac2">Clean up the export script</text>
+    <text x="480" y="417" font-size="12" fill="#a6acb9">Copilot / tools</text>
+    <text x="480" y="452" font-size="14" fill="#ffcc66">Could you try the export on a sample file?</text>
+    <rect x="480" y="483" width="65" height="30" rx="4" fill="#272d38" stroke="#3b4252"/>
+    <text x="497" y="503" font-size="12" fill="#cccac2">Peek</text>
+    <text x="561" y="503" font-size="12" fill="#a6acb9">Open the thread in Zed to reply.</text>
+  </g>
+</svg>

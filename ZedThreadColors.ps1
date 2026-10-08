@@ -607,6 +607,17 @@ namespace ZedColors
     {
         static Dictionary<string, string> cache = new Dictionary<string, string>();
         static readonly object findLock = new object(); // the search indexer also looks files up, on its own thread
+        public static Action<string> Report;
+
+        static void ReadWarning(string path, Exception ex)
+        {
+            if (Report != null) Report("history lookup failed for " + path + ": " + ex.Message);
+        }
+
+        static void ParseWarning(string path, Exception ex)
+        {
+            if (Report != null) Report("history entry could not be parsed in " + path + " (" + ex.GetType().Name + ")");
+        }
 
         static string Env(string name)
         {
@@ -665,10 +676,14 @@ namespace ZedColors
         static void Search(string dir, string pattern, int depth, List<string> found)
         {
             if (depth < 0 || !Directory.Exists(dir)) return;
-            try { found.AddRange(Directory.GetFiles(dir, pattern)); } catch { }
+            try { found.AddRange(Directory.GetFiles(dir, pattern)); }
+            catch (IOException ex) { ReadWarning(dir, ex); }
+            catch (UnauthorizedAccessException ex) { ReadWarning(dir, ex); }
             if (depth == 0) return;
             string[] subs;
-            try { subs = Directory.GetDirectories(dir); } catch { return; }
+            try { subs = Directory.GetDirectories(dir); }
+            catch (IOException ex) { ReadWarning(dir, ex); return; }
+            catch (UnauthorizedAccessException ex) { ReadWarning(dir, ex); return; }
             foreach (string s in subs) Search(s, pattern, depth - 1, found);
         }
 
@@ -676,7 +691,9 @@ namespace ZedColors
         {
             if (depth < 0 || !Directory.Exists(dir)) return;
             string[] subs;
-            try { subs = Directory.GetDirectories(dir); } catch { return; }
+            try { subs = Directory.GetDirectories(dir); }
+            catch (IOException ex) { ReadWarning(dir, ex); return; }
+            catch (UnauthorizedAccessException ex) { ReadWarning(dir, ex); return; }
             foreach (string s in subs)
             {
                 if (string.Equals(Path.GetFileName(s), name, StringComparison.OrdinalIgnoreCase)) Search(s, "*.json*", 1, found);
@@ -705,7 +722,7 @@ namespace ZedColors
 
             if (path.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
             {
-                try { return Generic(js.DeserializeObject(text)); } catch { return null; }
+                return Generic(js.DeserializeObject(text));
             }
 
             string[] lines = text.Split('\n');
@@ -713,8 +730,11 @@ namespace ZedColors
             {
                 string line = lines[i].Trim();
                 if (line.Length < 2 || line[0] != '{') continue;
+                if (i == lines.Length - 1 && !text.EndsWith("\n") && !line.EndsWith("}")) continue;
                 object o;
-                try { o = js.DeserializeObject(line); } catch { continue; }
+                try { o = js.DeserializeObject(line); }
+                catch (ArgumentException ex) { ParseWarning(path, ex); continue; }
+                catch (InvalidOperationException ex) { ParseWarning(path, ex); continue; }
                 string p = FromLine(o as Dictionary<string, object>);
                 if (p != null) return p;
             }
@@ -1197,7 +1217,8 @@ namespace ZedColors
         public bool WantText;              // false = usage numbers only (not a Zed thread)
         public long Offset, Len;
         public DateTime Write = DateTime.MinValue;
-        public bool Skipping, Dirty, LoggedError;
+        public bool Skipping, Dirty;
+        public string ReadError, ParseError;
         public List<Msg> Msgs = new List<Msg>();
         public Msg[] Frozen = new Msg[0];  // copy handed to the search thread
         public Dictionary<string, bool> Seen = new Dictionary<string, bool>();
@@ -1300,6 +1321,7 @@ namespace ZedColors
 
         public void Reset()
         {
+            ReadError = null; ParseError = null;
             HasTurn = false; Working = false; TurnStart = DateTime.MinValue; TurnEnd = DateTime.MinValue; LastTools = 0;
             Reads = 0; Commands = 0; Searches = 0; Helpers = 0; Edited = new List<string>(); Step = "";
             Offset = 0; Len = 0; Write = DateTime.MinValue; Skipping = false; Dirty = true;
@@ -1319,9 +1341,16 @@ namespace ZedColors
         public string Project = "";
         public string File;
         public Msg[] Msgs;
+        public string Prompt, Problem;
     }
 
-    public class IndexSnapshot { public List<ThreadDoc> Docs; public bool Building; public int Done, Total; }
+    public class IndexSnapshot
+    {
+        public List<ThreadDoc> Docs;
+        public bool Building;
+        public int Done, Total, Unavailable;
+        public string Problem;
+    }
 
     public class ThreadUsage
     {
@@ -1356,6 +1385,15 @@ namespace ZedColors
         Dictionary<string, FileScan> scans = new Dictionary<string, FileScan>(StringComparer.OrdinalIgnoreCase);
         Dictionary<string, string> files = new Dictionary<string, string>();
         Dictionary<string, DateTime> missing = new Dictionary<string, DateTime>();
+        class PromptCache
+        {
+            public long Length;
+            public DateTime Write;
+            public string Text;
+        }
+        Dictionary<string, PromptCache> prompts = new Dictionary<string, PromptCache>(StringComparer.OrdinalIgnoreCase);
+        List<ThreadDoc> lastDocs = new List<ThreadDoc>();
+        string dbProblem;
         System.Web.Script.Serialization.JavaScriptSerializer js;
 
         public volatile IndexSnapshot Index;
@@ -1388,10 +1426,20 @@ namespace ZedColors
                 // Thread files are checked every 1.5 s (only new bytes are read, so this is cheap);
                 // the wider usage-only files every 30 s.
                 bool full = firstPass || (t0 - lastFull).TotalSeconds >= 30;
-                try { Pass(full); }
-                catch (Exception ex) { host.Log("indexer error: " + ex.Message); }
-                if (full) lastFull = t0;
-                if (firstPass)
+                bool succeeded = false;
+                try { Pass(full); succeeded = true; }
+                catch (Exception ex)
+                {
+                    host.LogOnce("indexer", "indexer error: " + ex.Message);
+                    IndexSnapshot old = Index;
+                    Index = new IndexSnapshot { Docs = old == null ? new List<ThreadDoc>() : old.Docs,
+                        Done = old == null ? 0 : old.Done, Total = old == null ? 0 : old.Total,
+                        Unavailable = old == null ? 0 : old.Unavailable,
+                        Problem = "History refresh failed; showing any cached results. Open log for details." };
+                    host.Post(host.OnIndex);
+                }
+                if (full && succeeded) lastFull = t0;
+                if (firstPass && succeeded)
                 {
                     firstPass = false;
                     host.Log("search index built in " + (int)(DateTime.Now - t0).TotalSeconds + " s (" + scans.Count + " history files)");
@@ -1412,26 +1460,23 @@ namespace ZedColors
                 return string.CompareOrdinal(b.Info.Updated, a.Info.Updated);
             });
 
-            if (firstPass)
-            {
-                // The open thread and the usage numbers first, so the chip fills in quickly.
-                if (docs.Count > 0 && docs[0].Info.Session == act) IndexDoc(docs[0]);
-                ScanUsageFiles();
-                PublishUsage(docs);
-            }
-            else if (full) ScanUsageFiles();
-
-            bool changed = firstPass || full;
+            if (firstPass) Publish(docs, 0, true);
             int done = 0;
             foreach (ThreadDoc d in docs)
             {
                 if (stop) return;
-                if (IndexDoc(d)) changed = true;
+                IndexDoc(d);
                 done++;
-                if (firstPass && done % 10 == 0) Publish(docs, done, true);
+                if (firstPass && (done == 1 || done % 10 == 0))
+                {
+                    Publish(docs, done, true);
+                    PublishUsage(docs);
+                }
             }
-            if (changed) Publish(docs, docs.Count, false);
+            Publish(docs, docs.Count, false);
             PublishUsage(docs);
+            // Thread status must not wait for the wider, usage-only file scan.
+            if (full) { ScanUsageFiles(); PublishUsage(docs); }
         }
 
         void Publish(List<ThreadDoc> docs, int done, bool building)
@@ -1439,6 +1484,8 @@ namespace ZedColors
             IndexSnapshot s = new IndexSnapshot();
             s.Docs = new List<ThreadDoc>(docs);
             s.Building = building; s.Done = done; s.Total = docs.Count;
+            s.Problem = dbProblem;
+            foreach (ThreadDoc d in docs) if (d.Problem != null) s.Unavailable++;
             Index = s;
             host.Post(host.OnIndex);
         }
@@ -1446,16 +1493,22 @@ namespace ZedColors
         List<ThreadDoc> LoadDocs()
         {
             List<ThreadDoc> list = new List<ThreadDoc>();
-            string db = App.ZedDbPath();
-            if (db == null) return list;
             List<string[]> rows;
             try
             {
+                string db = App.ZedDbPath();
+                if (db == null) throw new FileNotFoundException("Zed database not found");
                 rows = Sqlite.Query(db,
                     "SELECT agent_id, session_id, COALESCE(NULLIF(title_override,''), title), folder_paths, updated_at, COALESCE(archived,0) " +
                     "FROM sidebar_threads WHERE session_id IS NOT NULL AND session_id <> ''");
             }
-            catch (Exception ex) { host.Log("indexer: reading Zed's thread list failed: " + ex.Message); return list; }
+            catch (Exception ex)
+            {
+                dbProblem = "Thread list unavailable; showing any cached results. Open log for details.";
+                host.LogOnce("thread-list", "indexer: reading Zed's thread list failed: " + ex.Message);
+                return lastDocs;
+            }
+            dbProblem = null;
             foreach (string[] r in rows)
             {
                 ThreadInfo t = new ThreadInfo();
@@ -1466,6 +1519,7 @@ namespace ZedColors
                 d.Project = ProjectName(t.Folders);
                 list.Add(d);
             }
+            lastDocs = list;
             return list;
         }
 
@@ -1491,18 +1545,38 @@ namespace ZedColors
             return null;
         }
 
-        // Returns true when this thread has new messages since the last pass.
-        bool IndexDoc(ThreadDoc d)
+        void IndexDoc(ThreadDoc d)
         {
             string kind = KindOf(d.Info.Agent);
-            if (kind == null) return false;
+            if (kind == null) { d.Problem = "This agent's history format is not supported."; return; }
             string path = Resolve(d.Info);
-            if (path == null) return false;
-            bool changed;
-            FileScan f = Scan(path, kind, true, out changed);
+            if (path == null) { d.Problem = "Saved history unavailable. Open log for details."; return; }
             d.File = path;
-            d.Msgs = f.Frozen;
-            return changed;
+            if (path.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase))
+            {
+                FileScan f = Scan(path, kind, true);
+                d.Msgs = f.Frozen;
+                d.Problem = f.ReadError ?? f.ParseError;
+            }
+            else d.Problem = "Search is unavailable for this JSON history; the last prompt is still shown.";
+            try
+            {
+                FileInfo fi = new FileInfo(path);
+                PromptCache p;
+                if (!prompts.TryGetValue(path, out p) || p.Length != fi.Length || p.Write != fi.LastWriteTimeUtc)
+                {
+                    string text = Transcripts.LastPrompt(path);
+                    p = new PromptCache { Length = fi.Length, Write = fi.LastWriteTimeUtc, Text = text };
+                    prompts[path] = p;
+                }
+                d.Prompt = p.Text;
+            }
+            catch (Exception ex)
+            {
+                d.Prompt = null;
+                d.Problem = "Saved history could not be read. Open log for details.";
+                host.LogOnce("prompt:" + path, "prompt read failed for " + path + " (" + ex.GetType().Name + ")");
+            }
         }
 
         string Resolve(ThreadInfo t)
@@ -1510,12 +1584,15 @@ namespace ZedColors
             string p;
             if (files.TryGetValue(t.Session, out p) && File.Exists(p)) return p;
             DateTime until;
-            if (missing.TryGetValue(t.Session, out until) && DateTime.Now < until) return null;
+            // A new active thread can appear in Zed before its history file is created.
+            if (missing.TryGetValue(t.Session, out until) && DateTime.Now < until && t.Session != host.ActiveSession) return null;
             p = null;
-            try { p = Transcripts.Find(t.Agent, t.Session); } catch { }
-            if (p == null || !p.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase))
+            try { p = Transcripts.Find(t.Agent, t.Session); }
+            catch (Exception ex) { host.LogOnce("resolve:" + t.Session, "history lookup failed: " + ex.Message); }
+            if (p == null)
             {
-                missing[t.Session] = DateTime.Now.AddMinutes(10); // look again later, not every pass
+                host.LogOnce("missing:" + t.Session, "no saved history found for " + t.Agent + " session " + t.Session);
+                missing[t.Session] = DateTime.Now.AddSeconds(30);
                 return null;
             }
             p = Path.GetFullPath(p);
@@ -1556,16 +1633,24 @@ namespace ZedColors
             foreach (string f in found) if (Recent(f, since)) Scan(Path.GetFullPath(f), "copilot", false);
         }
 
-        static DateTime Mtime(string f) { try { return File.GetLastWriteTime(f); } catch { return DateTime.MinValue; } }
-        static bool Recent(string f, DateTime since) { return Mtime(f) >= since; }
+        DateTime Mtime(string f)
+        {
+            try { return File.GetLastWriteTime(f); }
+            catch (Exception ex) { host.LogOnce("mtime:" + f, "history timestamp failed for " + f + ": " + ex.Message); return DateTime.MinValue; }
+        }
+        bool Recent(string f, DateTime since) { return Mtime(f) >= since; }
 
-        static void Collect(string dir, string pattern, int depth, List<string> found)
+        void Collect(string dir, string pattern, int depth, List<string> found)
         {
             if (depth < 0 || !Directory.Exists(dir)) return;
-            try { found.AddRange(Directory.GetFiles(dir, pattern)); } catch { }
+            try { found.AddRange(Directory.GetFiles(dir, pattern)); }
+            catch (IOException ex) { host.LogOnce("collect:" + dir, "history scan failed for " + dir + ": " + ex.Message); }
+            catch (UnauthorizedAccessException ex) { host.LogOnce("collect:" + dir, "history scan failed for " + dir + ": " + ex.Message); }
             if (depth == 0) return;
             string[] subs;
-            try { subs = Directory.GetDirectories(dir); } catch { return; }
+            try { subs = Directory.GetDirectories(dir); }
+            catch (IOException ex) { host.LogOnce("collect:" + dir, "history scan failed for " + dir + ": " + ex.Message); return; }
+            catch (UnauthorizedAccessException ex) { host.LogOnce("collect:" + dir, "history scan failed for " + dir + ": " + ex.Message); return; }
             foreach (string s in subs) Collect(s, pattern, depth - 1, found);
         }
 
@@ -1590,10 +1675,11 @@ namespace ZedColors
                 f.WantText = true; // first read skipped the text; read it again with text
                 f.Reset();
             }
-            try { ReadNew(f); }
+            try { ReadNew(f); f.ReadError = null; }
             catch (Exception ex)
             {
-                if (!f.LoggedError) { f.LoggedError = true; host.Log("indexer: could not read " + path + ": " + ex.Message); }
+                f.ReadError = "Saved history could not be read. Open log for details.";
+                host.LogOnce("read:" + path, "indexer: could not read " + path + ": " + ex.Message);
             }
             if (f.Dirty) { f.Frozen = f.Msgs.ToArray(); f.Dirty = false; changed = true; }
             return f;
@@ -1603,7 +1689,7 @@ namespace ZedColors
         void ReadNew(FileScan f)
         {
             FileInfo fi = new FileInfo(f.Path);
-            if (!fi.Exists) return;
+            if (!fi.Exists) throw new FileNotFoundException("History file no longer exists", f.Path);
             DateTime w = fi.LastWriteTimeUtc;
             if (fi.Length == f.Len && w == f.Write) return;
             if (fi.Length < f.Offset) f.Reset(); // file was rewritten
@@ -1644,7 +1730,7 @@ namespace ZedColors
 
         Dictionary<string, object> Parse(string s)
         {
-            try { return js.DeserializeObject(s) as Dictionary<string, object>; } catch { return null; }
+            return js.DeserializeObject(s) as Dictionary<string, object>;
         }
 
         void Line(FileScan f, string s)
@@ -1656,7 +1742,11 @@ namespace ZedColors
                 else if (f.Kind == "codex") Codex(f, s);
                 else Copilot(f, s);
             }
-            catch { }
+            catch (Exception ex)
+            {
+                f.ParseError = "Some history entries could not be read. Open log for details.";
+                host.LogOnce("parse:" + f.Path, "history entry could not be parsed in " + f.Path + " (" + ex.GetType().Name + ")");
+            }
         }
 
         void Claude(FileScan f, string s)
@@ -2197,6 +2287,7 @@ namespace ZedColors
         int seq = 0;
         bool partial = false, placed = false;
         string previewRaw = "";
+        string resultStatus;
         string[] words = new string[0];
 
         int Px(float v) { return (int)Math.Round(v * sc); }
@@ -2331,7 +2422,12 @@ namespace ZedColors
             IndexSnapshot s = host.IndexSnap;
             if (s == null) status.Text = "Building the search index...";
             else if (s.Building) status.Text = "Indexing: " + s.Done + " of " + s.Total + " threads";
-            else status.Text = s.Total + " threads indexed";
+            else status.Text = s.Problem ?? (s.Total + " threads indexed" + Availability(s));
+        }
+
+        static string Availability(IndexSnapshot s)
+        {
+            return s.Unavailable > 0 ? " - " + s.Unavailable + " histories unavailable or incomplete (see log)" : "";
         }
 
         public void OnIndexUpdated()
@@ -2339,6 +2435,11 @@ namespace ZedColors
             if (!Visible) return;
             if (partial && box.Text.Trim().Length > 0) RunSearch();
             else if (box.Text.Trim().Length == 0) ShowStatus();
+            else
+            {
+                IndexSnapshot s = host.IndexSnap;
+                if (s != null && resultStatus != null) status.Text = s.Problem ?? (resultStatus + Availability(s));
+            }
         }
 
         void ClearPreview()
@@ -2352,7 +2453,7 @@ namespace ZedColors
             int my = ++seq;
             if (q.Length == 0)
             {
-                list.Items.Clear(); ClearPreview(); partial = false; ShowStatus();
+                list.Items.Clear(); ClearPreview(); partial = false; resultStatus = null; ShowStatus();
                 return;
             }
             IndexSnapshot snap = host.IndexSnap;
@@ -2364,13 +2465,15 @@ namespace ZedColors
             {
                 List<ResultItem> res;
                 int count = 0;
+                string error = null;
                 try { res = Searcher.Run(snap, q, inc, out count); }
-                catch (Exception ex) { res = new List<ResultItem>(); host.Log("search error: " + ex.Message); }
+                catch (Exception ex) { res = null; error = "Search failed. Open log for details."; host.Log("search error: " + ex.Message); }
                 try
                 {
                     BeginInvoke((MethodInvoker)delegate
                     {
                         if (my != seq || IsDisposed) return;
+                        if (error != null) { list.Items.Clear(); ClearPreview(); resultStatus = error; status.Text = error; return; }
                         ShowResults(res, count, snap, q);
                     });
                 }
@@ -2389,7 +2492,8 @@ namespace ZedColors
             string s = count == 0 ? "No matches" : count == 1 ? "1 thread" : count + " threads";
             if (count > 200) s += " (showing the newest 200)";
             if (snap.Building) s += "  - still indexing (" + snap.Done + " of " + snap.Total + ")";
-            status.Text = s;
+            resultStatus = s;
+            status.Text = snap.Problem ?? (s + Availability(snap));
         }
 
         void ShowSelected()
@@ -3481,13 +3585,11 @@ namespace ZedColors
         MenuItem barItem;
         bool barEnabled = true;
         List<ThreadInfo> threads = new List<ThreadInfo>();
-        DateTime nextDbLoad = DateTime.MinValue, nextPromptCheck = DateTime.MinValue;
         string activeRowKey = null;
         ThreadInfo active = null;
-        string promptFile = null, promptText = null;
-        long promptLen = -1; DateTime promptWrite = DateTime.MinValue;
-        Dictionary<string, bool> loggedMissing = new Dictionary<string, bool>();
+        string promptText = null;
         public byte[] PngBytes;
+        public int OcrRevision;
 
         // v3.0: thread search + usage meter
         Indexer indexer;
@@ -3500,6 +3602,7 @@ namespace ZedColors
         const int HotkeyId = 0x5A43;
         const int HotkeyId2 = 0x5A44;
         static readonly object logLock = new object();
+        Dictionary<string, string> logWarnings = new Dictionary<string, string>();
 
         // Status dots, hover card, working timer
         Dictionary<string, DateTime> seen = new Dictionary<string, DateTime>(); // session -> when you last had it open
@@ -3529,15 +3632,8 @@ namespace ZedColors
             Directory.CreateDirectory(dir);
             dataPath = Path.Combine(dir, "colors.tsv");
             logPath = Path.Combine(dir, "log.txt");
+            Transcripts.Report = delegate (string message) { LogOnce(message, message); };
             Load();
-
-            // First run: turn on "Start with Windows" so it's always there when Zed is.
-            string marker = Path.Combine(dir, "installed.txt");
-            if (!File.Exists(marker))
-            {
-                try { File.WriteAllText(marker, DateTime.Now.ToString("s")); } catch { }
-                if (!IsStartup()) ToggleStartup();
-            }
 
             form = new BoxForm();
             form.Host = this;
@@ -3571,7 +3667,7 @@ namespace ZedColors
             tray.ContextMenu = menu;
             tray.Visible = true;
             tray.ShowBalloonTip(4000, "Zed Thread Colors is running",
-                "Boxes appear next to your threads whenever Zed is the active window. Right-click this icon for options.",
+                "Right-click this icon for Search, Needs you, and the optional Start with Windows setting.",
                 ToolTipIcon.Info);
             Log("started. script=" + scriptPath);
 
@@ -3697,7 +3793,11 @@ namespace ZedColors
             ScrubRings(px, capW, ch, p.X, p.Y);
 
             int edge = FindEdge(px, capW, ch);
-            if (edge < 0) { HideForm(); lastHash = 0; lastClient = Rectangle.Empty; return false; }
+            if (edge < 0)
+            {
+                LogOnce("sidebar-edge", "could not locate Zed's left threads sidebar; make sure it is open");
+                HideForm(); lastHash = 0; lastClient = Rectangle.Empty; return false;
+            }
 
             sidebar = new Rectangle(p.X, p.Y, edge, ch);
             lastPx = px; lastCapW = capW; lastCh = ch;
@@ -3713,8 +3813,24 @@ namespace ZedColors
             if (hash == lastHash) { ShowForm(); return false; }
             lastHash = hash;
             PngBytes = MakeOcrImage(px, capW, ch, edge);
+            OcrRevision++;
             return true;
         }
+
+        public bool CanApplyOcr(int revision)
+        {
+            if (revision != OcrRevision || paused || lastClient.IsEmpty || !Native.IsWindow(zedMain)
+                || !Native.IsWindowVisible(zedMain) || Native.IsIconic(zedMain)) return false;
+            IntPtr fg = Native.GetForegroundWindow();
+            bool overlay = (form.IsHandleCreated && fg == form.Handle) || (bar.IsHandleCreated && fg == bar.Handle);
+            if (!overlay && Native.GetAncestor(fg, 2) != zedMain) return false;
+            Native.RECT cr;
+            Native.POINT p = new Native.POINT();
+            if (!Native.GetClientRect(zedMain, out cr) || !Native.ClientToScreen(zedMain, ref p)) return false;
+            return lastClient == new Rectangle(p.X, p.Y, cr.R, cr.B);
+        }
+
+        public void RetryOcr() { lastHash = 0; }
 
         public void BeginOcr() { words.Clear(); }
 
@@ -3879,7 +3995,7 @@ namespace ZedColors
             if (r.Key == activeRowKey && active != null) return;
             activeRowKey = r.Key;
             ThreadInfo t = FindThread(r.Project, r.Title);
-            if (t == null) Log("open thread '" + r.Title + "' (" + r.Project + ") not found in Zed's thread list");
+            if (t == null) LogOnce("unmatched:" + r.Key, "open thread '" + r.Title + "' (" + r.Project + ") not found in Zed's thread list");
             else Log("open thread: '" + t.Display + "' agent=" + t.Agent + " session=" + t.Session);
             SetActive(t);
         }
@@ -3892,10 +4008,9 @@ namespace ZedColors
             if (ci != null) ci.SetFolders(t == null ? null : t.Folders);
             if (!same)
             {
-                promptFile = null; promptText = null; promptLen = -1;
+                promptText = null;
                 navIndex = -1; // new thread: back to showing its latest prompt
                 bar.Expanded = false;
-                nextPromptCheck = DateTime.MinValue;
                 if (indexer != null) indexer.Wake(); // refresh the usage chip for the new thread now
             }
             UpdateChip();
@@ -3904,25 +4019,11 @@ namespace ZedColors
 
         void LoadThreads()
         {
-            if (DateTime.Now < nextDbLoad) return;
-            nextDbLoad = DateTime.Now.AddSeconds(5);
-            string db = ZedDbPath();
-            if (db == null) { Log("Zed database not found"); return; }
-            try
-            {
-                List<string[]> rows = Sqlite.Query(db,
-                    "SELECT agent_id, session_id, COALESCE(NULLIF(title_override,''), title), folder_paths, updated_at " +
-                    "FROM sidebar_threads WHERE session_id IS NOT NULL AND COALESCE(archived,0) = 0");
-                List<ThreadInfo> list = new List<ThreadInfo>();
-                foreach (string[] r in rows)
-                {
-                    ThreadInfo t = new ThreadInfo();
-                    t.Agent = r[0]; t.Session = r[1]; t.Display = r[2] ?? ""; t.Folders = r[3] ?? ""; t.Updated = r[4] ?? "";
-                    list.Add(t);
-                }
-                threads = list;
-            }
-            catch (Exception ex) { Log("reading Zed's thread list failed: " + ex.Message); }
+            IndexSnapshot s = IndexSnap;
+            if (s == null) return;
+            List<ThreadInfo> list = new List<ThreadInfo>();
+            foreach (ThreadDoc d in s.Docs) if (!d.Archived) list.Add(d.Info);
+            threads = list;
         }
 
         public static string ZedDbPath()
@@ -3944,7 +4045,6 @@ namespace ZedColors
 
         ThreadInfo FindThread(string project, string title)
         {
-            nextDbLoad = DateTime.MinValue;
             LoadThreads();
             return MatchThread(project, title);
         }
@@ -3998,11 +4098,7 @@ namespace ZedColors
         void RefreshPromptMaybe()
         {
             if (!barEnabled) { HideBar(); return; }
-            if (DateTime.Now >= nextPromptCheck)
-            {
-                nextPromptCheck = DateTime.Now.AddSeconds(1.5);
-                try { RefreshPrompt(); } catch (Exception ex) { Log("prompt read error: " + ex.Message); }
-            }
+            RefreshPrompt();
             UpdateBarStatus();
             LayoutBar();
         }
@@ -4010,31 +4106,19 @@ namespace ZedColors
         void RefreshPrompt()
         {
             if (active == null) { promptText = null; return; }
-            if (promptFile == null || !File.Exists(promptFile))
+            IndexSnapshot s = IndexSnap;
+            promptText = "Loading saved history...";
+            if (s != null)
             {
-                promptFile = Transcripts.Find(active.Agent, active.Session);
-                promptLen = -1;
-                if (promptFile == null)
+                ThreadDoc doc = s.Docs.Find(delegate (ThreadDoc d) { return d.Info.Session == active.Session; });
+                if (doc != null)
                 {
-                    if (!loggedMissing.ContainsKey(active.Session))
-                    {
-                        loggedMissing[active.Session] = true;
-                        Log("no saved history found for " + active.Agent + " session " + active.Session);
-                    }
-                    promptText = null;
-                    return;
+                    promptText = doc.Prompt ?? doc.Problem ?? (s.Building ? "Loading saved history..." : "No user prompt found in saved history.");
                 }
-                Log("history file: " + promptFile);
+                else promptText = s.Problem ?? (s.Building ? "Loading saved history..." : "This thread is not in the saved thread list.");
             }
-            FileInfo fi = new FileInfo(promptFile);
-            if (fi.Length == promptLen && fi.LastWriteTimeUtc == promptWrite) return;
-            promptLen = fi.Length; promptWrite = fi.LastWriteTimeUtc;
-            string p = Transcripts.LastPrompt(promptFile);
-            if (p == null && promptText == null) Log("no prompt recognized in " + promptFile);
-            if (p != null) promptText = p;
             bar.Agent = active.AgentName;
             UpdateBarPrompt();
-            bar.Invalidate();
         }
 
         public void LayoutBar()
@@ -4077,6 +4161,9 @@ namespace ZedColors
 
         public void OnIndex()
         {
+            LoadThreads();
+            if (form.Rows.Count > 0) DetectActive(form.Rows);
+            RefreshPromptMaybe();
             if (search != null && !search.IsDisposed) search.OnIndexUpdated();
             if (peek != null && !peek.IsDisposed && peek.Visible) peek.UpdateContent();
         }
@@ -5036,22 +5123,38 @@ namespace ZedColors
                 using (RegistryKey k = Registry.CurrentUser.OpenSubKey(RunKey))
                     return k != null && k.GetValue(RunName) != null;
             }
-            catch { return false; }
+            catch (Exception ex) { LogOnce("startup-read", "could not read Windows startup setting: " + ex.Message); return false; }
         }
 
         void ToggleStartup()
         {
             try
             {
-                using (RegistryKey k = Registry.CurrentUser.OpenSubKey(RunKey, true))
+                using (RegistryKey k = Registry.CurrentUser.CreateSubKey(RunKey))
                 {
-                    if (k == null) return;
+                    if (k == null) throw new IOException("Windows startup registry key is unavailable");
                     if (k.GetValue(RunName) != null) k.DeleteValue(RunName, false);
                     else k.SetValue(RunName, "powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File \"" + scriptPath + "\"");
                 }
             }
-            catch (Exception ex) { Log("startup toggle failed: " + ex.Message); }
+            catch (Exception ex)
+            {
+                Log("startup toggle failed: " + ex.Message);
+                MessageBox.Show("Could not change Start with Windows. Open the log for details.",
+                    "Zed Thread Colors", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
             if (startupItem != null) startupItem.Checked = IsStartup();
+        }
+
+        public void LogOnce(string key, string msg)
+        {
+            lock (logLock)
+            {
+                string old;
+                if (logWarnings.TryGetValue(key, out old) && old == msg) return;
+                logWarnings[key] = msg;
+                Log(msg);
+            }
         }
 
         public void Log(string msg)
@@ -5113,58 +5216,94 @@ try {
     $null = [Windows.Storage.Streams.RandomAccessStream, Windows.Storage.Streams, ContentType = WindowsRuntime]
     $null = [Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime]
 
-    $script:awaiter = [System.WindowsRuntimeSystemExtensions].GetMember('GetAwaiter') |
-        Where-Object { $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' } |
-        Select-Object -First 1
-    function Await($op, [Type]$type) {
-        $script:awaiter.MakeGenericMethod($type).Invoke($null, @($op)).GetResult()
-    }
-
-    $script:ocr = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
-    if ($null -eq $script:ocr) {
+    if ($null -eq [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()) {
         Show-Error 'Windows text recognition is not available. Add an English language pack in Windows Settings > Time & language > Language.'
         return
     }
 
-    $script:tempPng = Join-Path $env:TEMP 'zed-thread-colors-ocr.png'
+    $ocrSource = @'
+param([byte[]]$bytes)
+$ErrorActionPreference = 'Stop'
+[System.Threading.Thread]::CurrentThread.Priority = [System.Threading.ThreadPriority]::BelowNormal
+if ($null -eq $script:ocr) {
+    Add-Type -AssemblyName System.Runtime.WindowsRuntime
+    $null = [Windows.Foundation.IAsyncOperation`1, Windows.Foundation, ContentType = WindowsRuntime]
+    $null = [Windows.Graphics.Imaging.SoftwareBitmap, Windows.Foundation, ContentType = WindowsRuntime]
+    $null = [Windows.Storage.Streams.RandomAccessStream, Windows.Storage.Streams, ContentType = WindowsRuntime]
+    $null = [Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime]
+    $script:awaiter = [System.WindowsRuntimeSystemExtensions].GetMember('GetAwaiter') |
+        Where-Object { $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' } |
+        Select-Object -First 1
+    $script:ocr = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]::TryCreateFromUserProfileLanguages()
+    if ($null -eq $script:ocr) { throw 'Windows text recognition is unavailable. Check your Windows language pack.' }
+    $script:tempPng = Join-Path $env:TEMP ('zed-thread-colors-ocr-' + $PID + '.png')
     $script:useFile = $false
+}
+$script:warning = $null
 
-    function Get-Bitmap([byte[]]$bytes) {
-        if (-not $script:useFile) {
-            try {
-                $ms = New-Object System.IO.MemoryStream(, $bytes)
-                $ras = [System.IO.WindowsRuntimeStreamExtensions]::AsRandomAccessStream($ms)
-                $dec = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($ras)) ([Windows.Graphics.Imaging.BitmapDecoder])
-                return Await ($dec.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
-            } catch {
-                $script:app.Log('memory-stream OCR input failed, switching to temp file: ' + $_.Exception.Message)
-                $script:useFile = $true
-            }
+function Await($op, [Type]$type) {
+    $script:awaiter.MakeGenericMethod($type).Invoke($null, @($op)).GetResult()
+}
+
+function Get-Bitmap([byte[]]$bytes) {
+    if (-not $script:useFile) {
+        $ms = $null; $ras = $null
+        try {
+            $ms = New-Object System.IO.MemoryStream(, $bytes)
+            $ras = [System.IO.WindowsRuntimeStreamExtensions]::AsRandomAccessStream($ms)
+            $dec = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($ras)) ([Windows.Graphics.Imaging.BitmapDecoder])
+            return Await ($dec.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+        } catch {
+            $script:warning = 'memory-stream OCR input failed, switching to temp file: ' + $_.Exception.Message
+            $script:useFile = $true
+        } finally {
+            if ($null -ne $ras) { $ras.Dispose() }
+            if ($null -ne $ms) { $ms.Dispose() }
         }
+    }
+    $stream = $null
+    try {
         [System.IO.File]::WriteAllBytes($script:tempPng, $bytes)
         $file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($script:tempPng)) ([Windows.Storage.StorageFile])
         $stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
-        try {
-            $dec = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
-            return Await ($dec.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
-        } finally { $stream.Dispose() }
+        $dec = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+        return Await ($dec.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+        if ([System.IO.File]::Exists($script:tempPng)) { [System.IO.File]::Delete($script:tempPng) }
     }
+}
 
-    function Invoke-Ocr([byte[]]$bytes) {
-        $bmp = Get-Bitmap $bytes
-        $res = Await ($script:ocr.RecognizeAsync($bmp)) ([Windows.Media.Ocr.OcrResult])
-        $script:app.BeginOcr()
-        $li = 0
-        foreach ($line in $res.Lines) {
-            foreach ($w in $line.Words) {
-                $r = $w.BoundingRect
-                $script:app.AddWord($li, $w.Text, $r.X, $r.Y, $r.Width, $r.Height)
-            }
-            $li++
+$bmp = $null
+try {
+    $bmp = Get-Bitmap $bytes
+    $res = Await ($script:ocr.RecognizeAsync($bmp)) ([Windows.Media.Ocr.OcrResult])
+    $words = New-Object 'System.Collections.Generic.List[ZedColors.Word]'
+    $li = 0
+    foreach ($line in $res.Lines) {
+        foreach ($w in $line.Words) {
+            $r = $w.BoundingRect
+            $word = New-Object ZedColors.Word
+            $word.Line = $li; $word.Text = $w.Text
+            $word.X = $r.X; $word.Y = $r.Y; $word.W = $r.Width; $word.H = $r.Height
+            $words.Add($word)
         }
-        $script:app.EndOcr()
+        $li++
     }
+    [pscustomobject]@{ Words = $words; Warning = $script:warning }
+} finally {
+    if ($null -ne $bmp) { $bmp.Dispose() }
+}
+'@
 
+    $script:ocrRunspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+    $script:ocrRunspace.ApartmentState = [System.Threading.ApartmentState]::MTA
+    $script:ocrRunspace.ThreadOptions = [System.Management.Automation.Runspaces.PSThreadOptions]::ReuseThread
+    $script:ocrRunspace.Open()
+    $script:ocrWorker = [System.Management.Automation.PowerShell]::Create()
+    $script:ocrWorker.Runspace = $script:ocrRunspace
+    $script:ocrJob = $null
+    $script:ocrPending = $false
     $script:app = New-Object ZedColors.App($PSCommandPath)
     $script:busy = $false
     $script:errors = 0
@@ -5175,7 +5314,41 @@ try {
         if ($script:busy) { return }
         $script:busy = $true
         try {
-            if ($script:app.Prepare()) { Invoke-Ocr $script:app.PngBytes }
+            # Do not replace the capture while OCR is reading it: animated sidebar icons
+            # otherwise invalidate every result before it can be drawn.
+            if ($null -ne $script:ocrJob -and -not $script:ocrJob.IsCompleted) { return }
+            if ($null -ne $script:ocrJob -and $script:ocrJob.IsCompleted) {
+                try {
+                    $results = $script:ocrWorker.EndInvoke($script:ocrJob)
+                    if ($script:ocrWorker.Streams.Error.Count -gt 0) {
+                        throw $script:ocrWorker.Streams.Error[0].Exception
+                    }
+                    if ($results.Count -ne 1) { throw 'Text recognition returned an unexpected result.' }
+                    $result = $results[0]
+                    $script:app.LogOnce('ocr-ready', 'sidebar text recognition ready')
+                    if ($null -ne $result.Warning) { $script:app.LogOnce('ocr-input', $result.Warning) }
+                    if ($script:app.CanApplyOcr($script:ocrRevision)) {
+                        $script:app.BeginOcr()
+                        foreach ($w in $result.Words) {
+                            $script:app.AddWord($w.Line, $w.Text, $w.X, $w.Y, $w.W, $w.H)
+                        }
+                        $script:app.EndOcr()
+                    } elseif (-not $script:ocrPending) { $script:app.RetryOcr() }
+                } catch {
+                    $script:app.LogOnce('ocr-worker', 'text recognition failed: ' + $_.Exception.Message)
+                    if (-not $script:ocrPending) { $script:app.RetryOcr() }
+                } finally { $script:ocrJob = $null }
+            }
+            if ($script:app.Prepare()) { $script:ocrPending = $true }
+            if ($null -eq $script:ocrJob -and $script:ocrPending) {
+                $script:ocrWorker.Commands.Clear()
+                $script:ocrWorker.Streams.Error.Clear()
+                $null = $script:ocrWorker.AddScript($ocrSource).AddArgument($script:app.PngBytes)
+                $script:ocrRevision = $script:app.OcrRevision
+                $script:ocrJob = $script:ocrWorker.BeginInvoke()
+                $script:app.LogOnce('ocr-started', 'sidebar text recognition started on background worker')
+                $script:ocrPending = $false
+            }
         } catch {
             $script:errors++
             if ($script:errors -le 50) { $script:app.Log('tick error: ' + $_.Exception.Message) }
@@ -5189,4 +5362,9 @@ try {
 }
 catch {
     Show-Error ("Zed Thread Colors could not start:`n`n" + $_.Exception.Message)
+}
+finally {
+    if ($null -ne $timer) { $timer.Stop(); $timer.Dispose() }
+    if ($null -ne $script:ocrWorker) { $script:ocrWorker.Stop(); $script:ocrWorker.Dispose() }
+    if ($null -ne $script:ocrRunspace) { $script:ocrRunspace.Dispose() }
 }

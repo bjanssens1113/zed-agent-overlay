@@ -6,6 +6,10 @@ I run Claude Code, Codex and GitHub Copilot side by side in Zed every day. Zed i
 
 It sits on top of Zed's window, follows it around, and never changes anything in Zed or in your agents' files.
 
+![Illustrative preview of thread colors, status rings, the last-prompt bar, and Needs you](docs/overlay-preview.svg)
+
+*Illustrative preview with made-up threads and usage numbers, not a screenshot.*
+
 ## What it adds
 
 **In the threads sidebar**
@@ -40,12 +44,12 @@ It sits on top of Zed's window, follows it around, and never changes anything in
 2. Double-click **Start Zed Thread Colors**. A four-color icon appears in the system tray.
 3. Bring Zed to the front. The bars appear beside your threads within a few seconds.
 
-The first run turns on **Start with Windows** (tray menu to turn it off). To update: tray icon > **Quit**, replace the files, start it again.
+**Start with Windows is off by default.** Enable it from the tray menu if you want the overlay to start when you sign in. Updating an existing installation keeps your current startup setting. To update: tray icon > **Quit**, replace the files, start it again.
 
 ## How it works
 
-- **Finding threads on screen.** Zed doesn't tell Windows where its sidebar rows are, so the overlay reads the sidebar with Windows' built-in text recognition (OCR) and lines up with the thread names. It matches them to Zed's own thread list in Zed's local database (read-only).
-- **Reading the agents.** Each agent keeps its conversation in local files (`~/.claude/projects`, `~/.codex/sessions`, `~/.copilot/session-state`). The overlay reads them read-only, only the new part each time, on a low-priority background thread.
+- **Finding threads on screen.** Zed doesn't tell Windows where its sidebar rows are, so the overlay reads the sidebar with Windows' built-in text recognition (OCR) and lines up with the thread names. Recognition runs on a separate, low-priority worker, with one capture at a time so animated icons cannot prevent results from appearing. Results are discarded if Zed moves, resizes, minimizes, or loses focus while recognition runs. It matches names to a background-loaded copy of Zed's local thread database (read-only).
+- **Reading the agents.** Each agent keeps its conversation in local files (`~/.claude/projects`, `~/.codex/sessions`, `~/.copilot/session-state`). Search and usage read only the new part each time. The last-prompt reader checks a bounded portion of changed files. All history reading runs on a low-priority background thread, not on the interface thread.
 - **Nothing leaves your PC**, except the GitHub card's calls to GitHub through your own signed-in `gh` tool.
 - The prompt jump buttons press Zed's own default keys (`Ctrl+Alt+Shift+PageUp/PageDown`, `Ctrl+Alt+End`).
 - It keeps its own files in `%LOCALAPPDATA%\ZedThreadColors` (your colors, which threads you've seen, a log).
@@ -57,11 +61,13 @@ The first run turns on **Start with Windows** (tray menu to turn it off). To upd
 - **Colors are Zed's Ayu Mirage theme**, hard-coded in the `Theme` class near the top of the script. Change them there to match another theme.
 - **"Needs you" uses word patterns** to find asks in a reply. It can miss one or include a sentence that isn't one.
 - **No plan limits for Claude or Copilot.** Their files don't record them, so only Codex shows a percentage.
-- **It follows these agents' file formats as of October 2026.** If an agent changes its format, that part goes quiet (`--`) until the script is updated.
+- **It follows these agents' file formats as of October 2026.** Missing or unreadable histories are identified in the prompt bar and search status, with details in the log (tray > **Open log**). The open thread's history is retried on every background pass (about 1.5 seconds), so a newly created session can acquire its working ring as soon as its history appears. Other missing histories are checked again after 30 seconds. A changed format can still leave usage at `--` or produce no recognized messages; that does not mean the agent has no activity.
 
 ## Built with
 
 Written with Claude Code (Anthropic) and directed by a non-developer, which is rather the point. Issues and ideas are welcome.
+
+For development, run `powershell.exe -NoProfile -STA -File .\tests\Regression.Tests.ps1`. The checks use temporary sample histories and a generated image, without launching the overlay or changing your startup setting.
 
 ## License
 
