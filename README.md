@@ -20,12 +20,14 @@ It works across projects and applications in Zed. Status and helper tracking use
 - **Helper-agent dashes beneath the ring.** One blue dash per active helper, capped at six dashes with a **+** for more. The hover card and open-thread status show the exact count, distinguishing "Working with 3 helper agents" from "Waiting for 3 helper agents." Background commands and finished helpers are not counted.
 - **Hover card.** Rest the mouse on a thread to see its status, what it did this turn, your last prompt and its token use, without opening it.
 
-**At the top of the open thread**
-- **Last-prompt bar.** Your most recent prompt, always visible. Click to expand, right-click to copy.
+**Over the open thread**
+- **Last-prompt bar.** Your most recent prompt, expanded by default when the overlay starts or you switch threads. Click to collapse or expand, right-click to copy. A manual collapse lasts for the current thread, without changing the default.
 - **Previous / next / bottom buttons** that step through your prompts in the thread. The bar shows which prompt you are on ("11 of 12").
 - **What the agent is doing, in plain words.** "Working 3m 12s · Editing App.jsx", and a turn summary like "Read 4 files · ran 3 commands · edited 2 files (a.ps1, b.md)". Claude and Copilot describe each command in one line; that line is shown instead of the command.
 - **Usage chip.** Codex's weekly limit % and reset time, Claude's token counts, Copilot's premium requests. Click it for a summary of all three.
 - **GitHub card.** The newest GitHub Actions run for the repo(s) in the thread's folders: a progress bar while it runs, then passed or failed. Click to open the run.
+- **Movable, resizable panels.** Drag a panel's dotted handle to move it; drag an edge or corner to resize it. Making the prompt bar taller expands its wrapped text. Positions and sizes are remembered relative to Zed, follow its window, and stay within its visible main content area. The GitHub card follows the prompt bar until you adjust it independently.
+- **Agent dashboard.** A separate movable, resizable panel shows the current thread's recorded activity, active helper descriptions where available (otherwise counts), and questions needing your attention in other threads. Empty helper/attention sections disappear. Click an attention entry to Peek; scroll with the mouse wheel or the panel's arrow buttons. All information comes from local background-loaded snapshots, not inferred test results or milestones.
 
 **Windows you can open**
 - **Search threads** (magnifier button, tray menu, or `Ctrl+Alt+Shift+F`): search your prompts and the agents' replies across every thread, including archived ones.
@@ -49,6 +51,10 @@ It works across projects and applications in Zed. Status and helper tracking use
 
 **Start with Windows is off by default.** Enable it from the tray menu if you want the overlay to start when you sign in. Updating an existing installation keeps your current startup setting. To update: tray icon > **Quit**, replace the files, start it again.
 
+Use tray > **Lock overlay layout** to prevent accidental moves and resizes without disabling the panels' normal buttons. **Reset overlay layout** restores their original positions and sizes. Layout and lock preferences are saved locally and scale with your display's DPI; temporary window-size constraints do not overwrite your chosen layout.
+
+The dashboard has its own saved position and size and a tray > **Show agent dashboard** toggle. Lock/reset applies to all three panels. Copilot's injected agent messages, nested helper messages, and runtime notifications are excluded from Last Prompt, prompt navigation, and prompt counts.
+
 ## How it works
 
 - **Finding threads on screen.** Zed doesn't tell Windows where its sidebar rows are, so the overlay reads the sidebar with Windows' built-in text recognition (OCR) and lines up with the thread names. Recognition runs on a separate, low-priority worker, with one capture at a time so animated icons cannot prevent results from appearing. Results are discarded if Zed moves, resizes, minimizes, or loses focus while recognition runs. It matches names to a background-loaded copy of Zed's local thread database (read-only).
@@ -56,7 +62,7 @@ It works across projects and applications in Zed. Status and helper tracking use
 - **Claude background work.** Background jobs are tracked by task ID, including completions delivered as queued messages and helpers restarted through `SendMessage`. Duplicate notifications do not double-count a job or turn a finished thread blue again. A quiet background job is not assumed finished: after 30 minutes without recorded activity, the status says "No activity" and the working ring clears rather than turning green.
 - **Nothing leaves your PC**, except the GitHub card's calls to GitHub through your own signed-in `gh` tool.
 - The prompt jump buttons press Zed's own default keys (`Ctrl+Alt+Shift+PageUp/PageDown`, `Ctrl+Alt+End`).
-- It keeps its own files in `%LOCALAPPDATA%\ZedThreadColors` (your colors, which threads you've seen, a log).
+- It keeps its own files in `%LOCALAPPDATA%\ZedThreadColors` (your colors, which threads you've seen, panel layout in `layout.json`, and a log).
 
 ## Limits
 

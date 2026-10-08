@@ -815,6 +815,8 @@ namespace ZedColors
             if (type != null && (type == "user.message" || type == "user_message" || type.EndsWith(".user_message")))
             {
                 Dictionary<string, object> data = D(d, "data") ?? d;
+                string source = S(data, "source");
+                if (!string.IsNullOrEmpty(S(data, "parentToolCallId")) || (source != null && source.StartsWith("agent-", StringComparison.OrdinalIgnoreCase))) return null;
                 return Clean(S(data, "content") ?? S(data, "message") ?? S(data, "text"), max);
             }
             // Anything else shaped like {"role":"user","content":...}
@@ -902,7 +904,7 @@ namespace ZedColors
                 "<environment_context", "<user_instructions", "# AGENTS.md", "<permissions", "<user_shell_command",
                 "<system-reminder", "<local-command", "Caveat: The messages below", "[Request interrupted",
                 "<turn_aborted", "<ide_", "<current_datetime", "<reminder",
-                "<task-notification", "<artifact-view-context" // background-task notices Claude Code sends as "user" lines
+                "<task-notification", "<artifact-view-context", "<system_notification", "<system_reminder"
             };
             foreach (string p in prefixes) if (t.StartsWith(p, StringComparison.OrdinalIgnoreCase)) return true;
             return false;
@@ -928,13 +930,145 @@ namespace ZedColors
     }
 
     // ---------- The pinned "Your last prompt" bar ----------
-    public class PromptBar : Form
+    public class PanelPlacement
+    {
+        public float X, Y, Width, Height;
+    }
+
+    public class OverlayLayout
+    {
+        public bool Locked;
+        public bool DashboardEnabled = true;
+        public PanelPlacement Prompt, GitHub, Dashboard;
+    }
+
+    public class AdjustableOverlay : Form
     {
         public App Host;
+        public float UiScale = 1f;
+        int gesture;
+        bool consumeClick;
+        Point gesturePoint;
+        Rectangle gestureBounds;
+        public bool Adjusting { get { return gesture != 0; } }
+        protected bool VerticalAdjustment { get { return (gesture & 12) != 0; } }
+        protected virtual Size PanelMinimum { get { return new Size(PxLayout(220), PxLayout(68)); } }
+        protected int PxLayout(float v) { return Math.Max(1, (int)Math.Round(v * UiScale)); }
+        Rectangle Grip { get { return new Rectangle(PxLayout(8), PxLayout(10), PxLayout(14), PxLayout(18)); } }
+        bool Locked { get { return Host != null && Host.OverlayLocked; } }
+
+        public AdjustableOverlay() { ResizeRedraw = true; }
+
+        public static Rectangle ClampBounds(Rectangle bounds, Rectangle area, Size minimum)
+        {
+            if (area.Width <= 0 || area.Height <= 0) return Rectangle.Empty;
+            int w = Math.Min(area.Width, Math.Max(minimum.Width, bounds.Width));
+            int h = Math.Min(area.Height, Math.Max(minimum.Height, bounds.Height));
+            return new Rectangle(Math.Max(area.Left, Math.Min(area.Right - w, bounds.Left)),
+                Math.Max(area.Top, Math.Min(area.Bottom - h, bounds.Top)), w, h);
+        }
+
+        public static Rectangle GestureBounds(Rectangle start, Point delta, int edges, Rectangle area, Size minimum)
+        {
+            if (edges == 16) return ClampBounds(new Rectangle(start.Left + delta.X, start.Top + delta.Y, start.Width, start.Height), area, minimum);
+            int left = start.Left, right = start.Right, top = start.Top, bottom = start.Bottom;
+            int mw = Math.Min(minimum.Width, area.Width), mh = Math.Min(minimum.Height, area.Height);
+            if ((edges & 1) != 0) left = Math.Max(area.Left, Math.Min(right - mw, left + delta.X));
+            if ((edges & 2) != 0) right = Math.Min(area.Right, Math.Max(left + mw, right + delta.X));
+            if ((edges & 4) != 0) top = Math.Max(area.Top, Math.Min(bottom - mh, top + delta.Y));
+            if ((edges & 8) != 0) bottom = Math.Min(area.Bottom, Math.Max(top + mh, bottom + delta.Y));
+            return ClampBounds(Rectangle.FromLTRB(left, top, right, bottom), area, minimum);
+        }
+
+        int HitEdges(Point p)
+        {
+            int n = PxLayout(5), edges = 0;
+            if (p.X < n) edges |= 1;
+            else if (p.X >= Width - n) edges |= 2;
+            if (p.Y < n) edges |= 4;
+            else if (p.Y >= Height - n) edges |= 8;
+            return edges;
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            consumeClick = false;
+            if (e.Button != MouseButtons.Left) return;
+            int edges = HitEdges(e.Location);
+            bool grip = Grip.Contains(e.Location);
+            if (Locked) { consumeClick = grip || edges != 0; return; }
+            if (edges == 0 && !grip) return;
+            consumeClick = true;
+            gesture = edges == 0 ? 16 : edges;
+            gesturePoint = PointToScreen(e.Location);
+            gestureBounds = Bounds;
+            Capture = true;
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            if (Adjusting)
+            {
+                Point at = PointToScreen(e.Location);
+                Rectangle area = Host == null ? Screen.FromRectangle(Bounds).WorkingArea : Host.OverlayArea;
+                Bounds = GestureBounds(gestureBounds, new Point(at.X - gesturePoint.X, at.Y - gesturePoint.Y), gesture, area, PanelMinimum);
+                Invalidate();
+                return;
+            }
+            int edges = Locked ? 0 : HitEdges(e.Location);
+            Cursor = edges == 5 || edges == 10 ? Cursors.SizeNWSE
+                   : edges == 6 || edges == 9 ? Cursors.SizeNESW
+                   : (edges & 3) != 0 ? Cursors.SizeWE
+                   : (edges & 12) != 0 ? Cursors.SizeNS
+                   : !Locked && Grip.Contains(e.Location) ? Cursors.SizeAll : Cursors.Hand;
+        }
+
+        void FinishAdjustment()
+        {
+            int ended = gesture;
+            gesture = 0;
+            Capture = false;
+            if (Host != null && Bounds != gestureBounds)
+            {
+                Host.RememberOverlayBounds(this, (ended & 12) != 0);
+            }
+        }
+
+        protected bool ConsumeAdjustment(MouseEventArgs e)
+        {
+            if (e.Button != MouseButtons.Left) return false;
+            if (Adjusting) FinishAdjustment();
+            bool consumed = consumeClick;
+            consumeClick = false;
+            return consumed;
+        }
+
+        protected override void OnMouseCaptureChanged(EventArgs e)
+        {
+            base.OnMouseCaptureChanged(e);
+            if (Adjusting && !Capture) FinishAdjustment();
+        }
+
+        protected void DrawLayoutControls(Graphics g)
+        {
+            using (SolidBrush b = new SolidBrush(Locked ? Theme.Line : Theme.Dim))
+                for (int x = 0; x < 2; x++)
+                    for (int y = 0; y < 3; y++)
+                        g.FillEllipse(b, PxLayout(10 + x * 5), PxLayout(13 + y * 5), PxLayout(2), PxLayout(2));
+            if (!Locked)
+                using (Pen p = new Pen(Theme.Dim))
+                    for (int n = 4; n <= 10; n += 3)
+                        g.DrawLine(p, Width - PxLayout(n), Height - PxLayout(3), Width - PxLayout(3), Height - PxLayout(n));
+        }
+    }
+
+    public class PromptBar : AdjustableOverlay
+    {
         public string Agent = "";
         public string Prompt = "";
-        public bool Expanded = false;
-        public float UiScale = 1f;
+        public bool Expanded = true;
         public string Chip = "";                         // usage chip text at the right end
         public Color ChipColor = Color.FromArgb(150, 156, 168);
         public string Status = "";                       // "Working 3m 12s" / "Done 2m ago"
@@ -969,7 +1103,7 @@ namespace ZedColors
             get
             {
                 CreateParams cp = base.CreateParams;
-                cp.ExStyle |= 0x80; // WS_EX_TOOLWINDOW
+                cp.ExStyle |= 0x80 | 0x08000000; // TOOLWINDOW | NOACTIVATE
                 return cp;
             }
         }
@@ -979,13 +1113,21 @@ namespace ZedColors
         Font ChipFont() { return new Font(Theme.UiFont, 11.5f * UiScale, FontStyle.Regular, GraphicsUnit.Pixel); }
         public string NavLabel = "";                     // "11 of 12" while stepping through prompts
         int RowH { get { return Px(38); } }              // height of the collapsed bar / the top row when expanded
+        public int CollapsedHeight { get { return RowH; } }
+        protected override Size PanelMinimum { get { return new Size(Px(360), RowH); } }
+
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            if (VerticalAdjustment) Expanded = Height > RowH + Px(4);
+        }
 
         public int DesiredHeight(int width, int maxHeight)
         {
             if (!Expanded) return RowH;
             using (Font f = BodyFont())
             {
-                Size s = TextRenderer.MeasureText(Prompt, f, new Size(width - Px(28), int.MaxValue),
+                Size s = TextRenderer.MeasureText(Prompt, f, new Size(Math.Max(1, width - Px(42)), int.MaxValue),
                     TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix | TextFormatFlags.TextBoxControl);
                 return Math.Max(RowH, Math.Min(maxHeight, RowH + s.Height + Px(12)));
             }
@@ -997,7 +1139,8 @@ namespace ZedColors
             using (Pen b = new Pen(Theme.Line)) g.DrawRectangle(b, 0, 0, Width - 1, Height - 1);
             using (Font bf = BodyFont())
             {
-                int x = Px(14);
+                int x = Px(28);
+                int chipLimit = Math.Max(Px(20), (Width - Px(200)) / 2);
 
                 // Usage chip at the right end (click it for the full summary).
                 int chipW = 0;
@@ -1008,12 +1151,12 @@ namespace ZedColors
                     {
                         Size cs = TextRenderer.MeasureText(g, Chip, cf, Size.Empty, TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding);
                         int chh = Px(20);
-                        int cw = cs.Width + Px(14);
+                        int cw = Math.Min(cs.Width + Px(14), chipLimit);
                         chipRect = new Rectangle(Width - Px(10) - cw, (RowH - chh) / 2, cw, chh);
                         using (SolidBrush cb = new SolidBrush(Theme.Panel)) g.FillRectangle(cb, chipRect);
                         using (Pen cp = new Pen(Theme.Line)) g.DrawRectangle(cp, chipRect.X, chipRect.Y, chipRect.Width - 1, chipRect.Height - 1);
                         TextRenderer.DrawText(g, Chip, cf, chipRect, ChipColor,
-                            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+                            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
                         chipW = cw + Px(8);
                     }
                 }
@@ -1025,13 +1168,13 @@ namespace ZedColors
                     {
                         Size ss = TextRenderer.MeasureText(g, Status, cf, Size.Empty, TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding);
                         int chh = Px(20);
-                        int sw = ss.Width + Px(14);
+                        int sw = Math.Min(ss.Width + Px(14), chipLimit);
                         Rectangle sr = new Rectangle(Width - Px(10) - chipW - sw, (RowH - chh) / 2, sw, chh);
                         if (chipW > 0) sr.X += Px(2);
                         using (SolidBrush cb = new SolidBrush(Theme.Panel)) g.FillRectangle(cb, sr);
                         using (Pen cp = new Pen(Theme.Line)) g.DrawRectangle(cp, sr.X, sr.Y, sr.Width - 1, sr.Height - 1);
                         TextRenderer.DrawText(g, Status, cf, sr, StatusColor,
-                            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+                            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
                         chipW += sw + Px(6);
                     }
                 }
@@ -1076,27 +1219,29 @@ namespace ZedColors
                     if (NavLabel.Length > 0)
                     {
                         Size ls = TextRenderer.MeasureText(g, NavLabel, cf, Size.Empty, TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding);
-                        TextRenderer.DrawText(g, NavLabel, cf, new Rectangle(lx, 0, ls.Width, RowH), Theme.Working,
-                            TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
-                        lx += ls.Width + Px(10);
+                        int lw = Math.Min(ls.Width, Math.Max(0, textW));
+                        TextRenderer.DrawText(g, NavLabel, cf, new Rectangle(lx, 0, lw, RowH), Theme.Working,
+                            TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+                        lx += lw + Px(10);
                     }
                     if (!Expanded)
                     {
                         string one = Prompt.Replace("\r", " ").Replace("\n", " ");
-                        TextRenderer.DrawText(g, one, bf, new Rectangle(lx, 0, x + textW - lx, RowH), Fg,
+                        TextRenderer.DrawText(g, one, bf, new Rectangle(lx, 0, Math.Max(0, x + textW - lx), RowH), Fg,
                             TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
                     }
                     else
                     {
                         // Expanded: the turn summary on the top row, the full prompt underneath.
                         if (!string.IsNullOrEmpty(Summary))
-                            TextRenderer.DrawText(g, Summary, cf, new Rectangle(lx, 0, x + textW - lx, RowH), StatusColor == Theme.Working ? Theme.Working : Dim,
+                            TextRenderer.DrawText(g, Summary, cf, new Rectangle(lx, 0, Math.Max(0, x + textW - lx), RowH), StatusColor == Theme.Working ? Theme.Working : Dim,
                                 TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
-                        Rectangle br = new Rectangle(x, RowH, Width - x - Px(14), Height - RowH - Px(10));
+                        Rectangle br = new Rectangle(x, RowH, Math.Max(0, Width - x - Px(14)), Math.Max(0, Height - RowH - Px(10)));
                         TextRenderer.DrawText(g, Prompt, bf, br, Fg, TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix | TextFormatFlags.TextBoxControl | TextFormatFlags.EndEllipsis);
                     }
                 }
             }
+            DrawLayoutControls(g);
         }
 
         int ButtonAt(Point p)
@@ -1108,6 +1253,7 @@ namespace ZedColors
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
+            if (Adjusting) { if (tip != null) tip.Hide(this); return; }
             int b = ButtonAt(e.Location);
             if (b == hoverBtn) return;
             hoverBtn = b;
@@ -1126,6 +1272,7 @@ namespace ZedColors
 
         protected override void OnMouseUp(MouseEventArgs e)
         {
+            if (ConsumeAdjustment(e)) return;
             int b = ButtonAt(e.Location);
             if (b >= 0)
             {
@@ -1143,8 +1290,7 @@ namespace ZedColors
             }
             else
             {
-                Expanded = !Expanded;
-                Host.LayoutBar();
+                Host.TogglePromptExpansion();
                 Invalidate();
             }
             Host.RefocusZed();
@@ -1283,6 +1429,7 @@ namespace ZedColors
         public int Reads, Commands, Searches, Helpers;
         public HashSet<string> HelperTasks = new HashSet<string>();
         public Dictionary<string, string> HelperTools = new Dictionary<string, string>();
+        public Dictionary<string, string> HelperDescriptions = new Dictionary<string, string>();
         public bool WaitingForBackground;
         public int ActiveHelpers { get { return HelperTasks.Count; } }
         public List<string> Edited = new List<string>();
@@ -1351,9 +1498,31 @@ namespace ZedColors
 
         public void HelperStarted(string tool)
         {
+            HelperStarted(tool, null);
+        }
+
+        public void HelperStarted(string tool, string description)
+        {
             if (string.IsNullOrEmpty(tool) || HelperTools.ContainsKey(tool)) return;
             HelperTools[tool] = tool;
             HelperTasks.Add(tool);
+            if (!string.IsNullOrWhiteSpace(description))
+            {
+                string text = Regex.Replace(description, @"\s+", " ").Trim();
+                HelperDescriptions[tool] = text.Length > 240 ? text.Substring(0, 237) + "..." : text;
+            }
+        }
+
+        public string[] ActiveHelperDescriptions()
+        {
+            List<string> descriptions = new List<string>();
+            foreach (string task in HelperTasks)
+            {
+                string text;
+                if (HelperDescriptions.TryGetValue(task, out text)) descriptions.Add(text);
+            }
+            descriptions.Sort(StringComparer.OrdinalIgnoreCase);
+            return descriptions.ToArray();
         }
 
         public void HelperLaunched(string tool, string task)
@@ -1362,6 +1531,8 @@ namespace ZedColors
             if (string.IsNullOrEmpty(task) || !HelperTools.TryGetValue(tool, out old) || !HelperTasks.Remove(old)) return;
             HelperTools[tool] = task;
             HelperTasks.Add(task);
+            string description;
+            if (HelperDescriptions.TryGetValue(old, out description)) HelperDescriptions[task] = description;
         }
 
         public void HelperFinished(string task)
@@ -1438,6 +1609,7 @@ namespace ZedColors
             AskText = null; AskTime = DateTime.MinValue;
             BackgroundTasks.Clear(); BackgroundTools.Clear(); BackgroundStops.Clear();
             HelperTasks.Clear(); HelperTools.Clear(); WaitingForBackground = false;
+            HelperDescriptions.Clear();
             PremDay = new Dictionary<DateTime, int>(); PromptDay = new Dictionary<DateTime, int>();
         }
     }
@@ -1465,6 +1637,7 @@ namespace ZedColors
         public long Tokens = -1; public int Premium = -1; public int Prompts;
         public bool HasTurn, Working;
         public int ActiveHelpers;
+        public string[] HelperDescriptions = new string[0];
         public bool WaitingForHelpers;
         public DateTime TurnStart = DateTime.MinValue, TurnEnd = DateTime.MinValue, LastWrite = DateTime.MinValue;
         public string Summary = "", Step = "";
@@ -2030,7 +2203,7 @@ namespace ZedColors
                 case "Bash": case "PowerShell": f.Did("command", null, desc ?? "Running a command"); break;
                 case "Grep": case "Glob": case "ToolSearch": f.Did("search", null, "Searching the files"); break;
                 case "WebSearch": case "WebFetch": f.Did("search", null, "Looking things up online"); break;
-                case "Agent": case "Task": f.HelperStarted(tool); f.Did("helper", null, "Calling a helper agent" + (desc != null ? ": " + desc : "")); break;
+                case "Agent": case "Task": f.HelperStarted(tool, desc); f.Did("helper", null, "Calling a helper agent" + (desc != null ? ": " + desc : "")); break;
                 case "AskUserQuestion": f.Did("", null, "Waiting for your answer"); f.Ask(FormatQuestions(J.A(input, "questions"), "question", "options"), t, true); break;
                 case "TodoWrite": case "TaskStop": case "Monitor": break;
                 default: f.Did("", null, "Using " + Friendly(name)); break;
@@ -2066,7 +2239,9 @@ namespace ZedColors
                     if (J.S(data, "parentToolCallId") == null)
                     {
                         string id = J.S(data, "toolCallId");
-                        f.HelperStarted(id);
+                        string description = a == null ? null : J.S(a, "description");
+                        string helperName = a == null ? null : J.S(a, "name");
+                        f.HelperStarted(id, helperName == null ? description : helperName + (description == null ? "" : ": " + description));
                         if (id != null && a != null && J.S(a, "mode") == "background")
                         {
                             f.BackgroundStarted(id);
@@ -2202,13 +2377,17 @@ namespace ZedColors
             DateTime t = Ts(d);
             if (type == "user.message")
             {
-                f.Prompts++;
-                if (t != DateTime.MinValue) Inc(f.PromptDay, t.Date, 1);
-                if (f.WantText)
+                string prompt = Transcripts.FromLine(d, MaxText);
+                if (prompt != null)
                 {
-                    f.StartTurn(t);
-                    f.LastTools = 0;
-                    AddMsg(f, true, Transcripts.FromLine(d, MaxText), t);
+                    f.Prompts++;
+                    if (t != DateTime.MinValue) Inc(f.PromptDay, t.Date, 1);
+                    if (f.WantText)
+                    {
+                        f.StartTurn(t);
+                        f.LastTools = 0;
+                        AddMsg(f, true, prompt, t);
+                    }
                 }
             }
             else if (type == "assistant.message" && f.WantText && data != null && J.S(data, "parentToolCallId") == null)
@@ -2337,6 +2516,7 @@ namespace ZedColors
                 ThreadUsage tu = new ThreadUsage();
                 tu.HasTurn = f.HasTurn; tu.Working = f.Working; tu.TurnStart = f.TurnStart; tu.TurnEnd = f.TurnEnd;
                 tu.ActiveHelpers = f.ActiveHelpers;
+                tu.HelperDescriptions = f.ActiveHelperDescriptions();
                 tu.WaitingForHelpers = f.WaitingForBackground && f.ActiveHelpers > 0;
                 tu.Summary = f.Summary(); tu.Step = f.Step;
                 tu.AskText = f.AskText; tu.AskTime = f.AskTime;
@@ -3244,7 +3424,7 @@ namespace ZedColors
     }
 
     // The small card under the prompt bar with the newest GitHub Actions run. Click to open it.
-    public class CiCard : Form
+    public class CiCard : AdjustableOverlay
     {
         CiInfo info;
         float sc = 1f;
@@ -3262,6 +3442,7 @@ namespace ZedColors
             BackColor = Theme.Bg;
             DoubleBuffered = true;
             Cursor = Cursors.Hand;
+            Size = new Size(330, 68);
         }
 
         protected override bool ShowWithoutActivation { get { return true; } }
@@ -3281,12 +3462,13 @@ namespace ZedColors
             info = i;
             if (fSmall == null || Math.Abs(Math.Max(1f, scale) - sc) > 0.01f)
             {
+                if (fSmall != null) { fSmall.Dispose(); fBody.Dispose(); fBold.Dispose(); }
                 sc = Math.Max(1f, scale);
+                UiScale = sc;
                 fSmall = new Font(Theme.UiFont, 11.5f * sc, FontStyle.Regular, GraphicsUnit.Pixel);
                 fBody = new Font(Theme.UiFont, 12.5f * sc, FontStyle.Regular, GraphicsUnit.Pixel);
                 fBold = new Font(Theme.UiFont, 12.5f * sc, FontStyle.Bold, GraphicsUnit.Pixel);
             }
-            Size = new Size(Px(330), Px(68));
             Invalidate();
         }
 
@@ -3296,7 +3478,7 @@ namespace ZedColors
             Graphics g = e.Graphics;
             using (Pen b = new Pen(Theme.Line)) g.DrawRectangle(b, 0, 0, Width - 1, Height - 1);
             TextFormatFlags one = TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.VerticalCenter;
-            int x = Px(12), w = Width - Px(24);
+            int x = Px(28), w = Math.Max(1, Width - Px(40));
             string repo = info.Repo.Substring(info.Repo.IndexOf('/') + 1);
             TextRenderer.DrawText(g, "GitHub  \u00B7  " + repo + "  \u00B7  " + info.Workflow, fSmall, new Rectangle(x, Px(6), w, Px(16)), Theme.Dim, one);
 
@@ -3327,13 +3509,22 @@ namespace ZedColors
                 string ago = info.Updated == DateTime.MinValue ? "" : "  " + Theme.Ago(DateTime.Now - info.Updated) + " ago";
                 TextRenderer.DrawText(g, word + ago + (string.IsNullOrEmpty(info.Branch) ? "" : "  \u00B7  " + info.Branch), fBold, line2, col, one);
             }
-            TextRenderer.DrawText(g, info.Title ?? "", fBody, new Rectangle(x, Px(45), w, Px(18)), Theme.Fg, one);
+            TextRenderer.DrawText(g, info.Title ?? "", fBody, new Rectangle(x, Px(45), w, Math.Max(1, Height - Px(51))), Theme.Fg,
+                TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix | TextFormatFlags.TextBoxControl | TextFormatFlags.EndEllipsis);
+            DrawLayoutControls(g);
         }
 
         protected override void OnMouseUp(MouseEventArgs e)
         {
+            if (ConsumeAdjustment(e)) return;
             if (e.Button == MouseButtons.Left && info != null && !string.IsNullOrEmpty(info.Url) && info.Url.StartsWith("https://github.com/"))
                 try { Process.Start(info.Url); } catch { }
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && fSmall != null) { fSmall.Dispose(); fBody.Dispose(); fBold.Dispose(); fSmall = null; }
+            base.Dispose(disposing);
         }
     }
 
@@ -3409,6 +3600,159 @@ namespace ZedColors
         }
 
         static void Add(List<string> l, string s) { if (!l.Contains(s)) l.Add(s); }
+    }
+
+    public class DashboardAttention
+    {
+        public string Session, Title, Question;
+        public DateTime When;
+    }
+
+    public class DashboardData
+    {
+        public string Session = "", Thread = "", Status = "", Step = "";
+        public Color StatusColor = Theme.Dim;
+        public int ActiveHelpers;
+        public string[] HelperDescriptions = new string[0];
+        public DashboardAttention[] Attention = new DashboardAttention[0];
+    }
+
+    public class DashboardPanel : AdjustableOverlay
+    {
+        public DashboardData Data = new DashboardData();
+        int scroll, contentHeight;
+        Rectangle[] scrollButtons = new Rectangle[2];
+        List<KeyValuePair<Rectangle, string>> links = new List<KeyValuePair<Rectangle, string>>();
+        int Px(float v) { return PxLayout(v); }
+        protected override Size PanelMinimum { get { return new Size(Px(260), Px(160)); } }
+        protected override bool ShowWithoutActivation { get { return true; } }
+        protected override CreateParams CreateParams
+        {
+            get { CreateParams cp = base.CreateParams; cp.ExStyle |= 0x80 | 0x08000000; return cp; }
+        }
+        protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); Native.RoundCorners(Handle); }
+
+        public DashboardPanel()
+        {
+            FormBorderStyle = FormBorderStyle.None; ShowInTaskbar = false;
+            StartPosition = FormStartPosition.Manual; BackColor = Theme.Bg; DoubleBuffered = true;
+            Size = new Size(330, 300);
+        }
+
+        public void SetData(DashboardData next, float scale)
+        {
+            if (next == null) throw new ArgumentNullException("next");
+            bool changed = Math.Abs(UiScale - scale) > 0.01f || Data.Session != next.Session || Data.Thread != next.Thread
+                || Data.Status != next.Status || Data.Step != next.Step || Data.StatusColor != next.StatusColor
+                || Data.ActiveHelpers != next.ActiveHelpers || Data.HelperDescriptions.Length != next.HelperDescriptions.Length
+                || Data.Attention.Length != next.Attention.Length;
+            if (!changed)
+            {
+                for (int i = 0; i < next.HelperDescriptions.Length; i++)
+                    if (Data.HelperDescriptions[i] != next.HelperDescriptions[i]) changed = true;
+                for (int i = 0; i < next.Attention.Length; i++)
+                    if (Data.Attention[i].Session != next.Attention[i].Session || Data.Attention[i].Title != next.Attention[i].Title
+                        || Data.Attention[i].Question != next.Attention[i].Question) changed = true;
+            }
+            if (Data.Session != next.Session) scroll = 0;
+            Data = next; UiScale = scale;
+            if (changed) { links.Clear(); Invalidate(); }
+        }
+
+        int Paragraph(Graphics g, string text, Font font, Color color, int y, int width)
+        {
+            if (string.IsNullOrEmpty(text)) return 0;
+            TextFormatFlags flags = TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix | TextFormatFlags.TextBoxControl;
+            int h = TextRenderer.MeasureText(g, text, font, new Size(width, int.MaxValue), flags).Height;
+            TextRenderer.DrawText(g, text, font, new Rectangle(Px(14), y, width, h), color, flags);
+            return h + Px(5);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            using (Pen p = new Pen(Theme.Line)) { g.DrawRectangle(p, 0, 0, Width - 1, Height - 1); g.DrawLine(p, 1, Px(36), Width - 2, Px(36)); }
+            using (Font title = new Font(Theme.UiFont, 13f * UiScale, FontStyle.Bold, GraphicsUnit.Pixel))
+            using (Font body = new Font(Theme.UiFont, 12.5f * UiScale, FontStyle.Regular, GraphicsUnit.Pixel))
+            using (Font small = new Font(Theme.UiFont, 11.5f * UiScale, FontStyle.Regular, GraphicsUnit.Pixel))
+            {
+                TextRenderer.DrawText(g, "Agent dashboard", title, new Rectangle(Px(28), 0, Math.Max(1, Width - Px(78)), Px(36)),
+                    Theme.Fg, TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+                for (int i = 0; i < 2; i++)
+                {
+                    Rectangle r = new Rectangle(Width - Px(46 - i * 22), Px(9), Px(18), Px(18));
+                    scrollButtons[i] = r;
+                    using (Pen p = new Pen(Theme.Dim))
+                    {
+                        g.DrawRectangle(p, r);
+                        float cx = r.Left + r.Width / 2f, cy = r.Top + r.Height / 2f, d = (i == 0 ? -1 : 1) * UiScale;
+                        g.DrawLines(p, new PointF[] { new PointF(cx - 3 * UiScale, cy - d), new PointF(cx, cy + 2 * d), new PointF(cx + 3 * UiScale, cy - d) });
+                    }
+                }
+                GraphicsState state = g.Save();
+                g.SetClip(new Rectangle(1, Px(38), Math.Max(1, Width - 2), Math.Max(1, Height - Px(40))));
+                links.Clear();
+                int width = Math.Max(1, Width - Px(32)), y = Px(44) - scroll;
+                y += Paragraph(g, "Current activity", title, Theme.Dim, y, width);
+                y += Paragraph(g, Data.Thread, body, Theme.Fg, y, width);
+                y += Paragraph(g, Data.Status, body, Data.StatusColor, y, width);
+                y += Paragraph(g, Data.Step, small, Theme.Fg, y, width);
+                if (Data.ActiveHelpers > 0)
+                {
+                    y += Px(8);
+                    y += Paragraph(g, "Active helpers (" + Data.ActiveHelpers + ")", title, Theme.Working, y, width);
+                    foreach (string helper in Data.HelperDescriptions) y += Paragraph(g, "\u2022 " + helper, body, Theme.Fg, y, width);
+                    int unnamed = Data.ActiveHelpers - Data.HelperDescriptions.Length;
+                    if (unnamed > 0) y += Paragraph(g, unnamed + (unnamed == 1 ? " helper: details not recorded" : " helpers: details not recorded"), small, Theme.Dim, y, width);
+                }
+                if (Data.Attention.Length > 0)
+                {
+                    y += Px(8);
+                    y += Paragraph(g, "Needs your attention (" + Data.Attention.Length + ")", title, Theme.Accent, y, width);
+                    foreach (DashboardAttention item in Data.Attention)
+                    {
+                        int top = y;
+                        y += Paragraph(g, item.Title, body, Theme.Working, y, width);
+                        y += Paragraph(g, item.Question, small, Theme.Fg, y, width);
+                        links.Add(new KeyValuePair<Rectangle, string>(new Rectangle(Px(10), top, Width - Px(20), y - top), item.Session));
+                        y += Px(6);
+                    }
+                    y += Paragraph(g, "Click a thread to peek at its question.", small, Theme.Dim, y, width);
+                }
+                contentHeight = y + scroll - Px(38);
+                g.Restore(state);
+            }
+            int view = Math.Max(1, Height - Px(40)), max = Math.Max(0, contentHeight - view);
+            if (scroll > max) { scroll = max; Invalidate(); }
+            if (max > 0)
+            {
+                int h = Math.Min(view, Math.Max(Px(18), view * view / Math.Max(1, contentHeight)));
+                int y = Px(38) + (int)((view - h) * (double)scroll / max);
+                using (SolidBrush b = new SolidBrush(Theme.Dim)) g.FillRectangle(b, Width - Px(7), y, Px(3), h);
+            }
+            DrawLayoutControls(g);
+        }
+
+        void ScrollBy(int delta)
+        {
+            scroll = Math.Max(0, Math.Min(Math.Max(0, contentHeight - Math.Max(1, Height - Px(40))), scroll + delta));
+            links.Clear(); Invalidate();
+        }
+
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            base.OnMouseWheel(e);
+            ScrollBy(-Math.Sign(e.Delta) * Px(60));
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            if (ConsumeAdjustment(e) || e.Button != MouseButtons.Left) return;
+            for (int i = 0; i < 2; i++) if (scrollButtons[i].Contains(e.Location)) { ScrollBy((i == 0 ? -1 : 1) * Px(100)); return; }
+            if (e.Y < Px(38) || e.Y >= Height - Px(2)) return;
+            foreach (KeyValuePair<Rectangle, string> link in links)
+                if (link.Key.Contains(e.Location)) { if (Host != null) Host.Peek(link.Value); return; }
+        }
     }
 
     // A finished thread whose last reply asks you for something in its text.
@@ -3771,6 +4115,11 @@ namespace ZedColors
         // last-prompt bar state
         PromptBar bar;
         MenuItem barItem;
+        MenuItem layoutLockItem;
+        MenuItem dashboardItem;
+        DashboardPanel dashboard;
+        OverlayLayout overlayLayout = new OverlayLayout();
+        string layoutPath, layoutProblem;
         bool barEnabled = true;
         List<ThreadInfo> threads = new List<ThreadInfo>();
         string activeRowKey = null;
@@ -3820,6 +4169,8 @@ namespace ZedColors
             Directory.CreateDirectory(dir);
             dataPath = Path.Combine(dir, "colors.tsv");
             logPath = Path.Combine(dir, "log.txt");
+            layoutPath = Path.Combine(dir, "layout.json");
+            LoadOverlayLayout();
             Transcripts.Report = delegate (string message) { LogOnce(message, message); };
             Load();
 
@@ -3828,6 +4179,8 @@ namespace ZedColors
             rings = new RingForm();
             bar = new PromptBar();
             bar.Host = this;
+            dashboard = new DashboardPanel();
+            dashboard.Host = this;
             ui = new Control();
             IntPtr uiHandle = ui.Handle;
 
@@ -3843,6 +4196,13 @@ namespace ZedColors
             barItem = new MenuItem("Show last-prompt bar", delegate { barEnabled = !barEnabled; barItem.Checked = barEnabled; if (!barEnabled) HideBar(); });
             barItem.Checked = true;
             menu.MenuItems.Add(barItem);
+            dashboardItem = new MenuItem("Show agent dashboard", delegate { ToggleDashboard(); });
+            dashboardItem.Checked = overlayLayout.DashboardEnabled;
+            menu.MenuItems.Add(dashboardItem);
+            layoutLockItem = new MenuItem("Lock overlay layout", delegate { ToggleOverlayLock(); });
+            layoutLockItem.Checked = overlayLayout.Locked;
+            menu.MenuItems.Add(layoutLockItem);
+            menu.MenuItems.Add("Reset overlay layout", delegate { ResetOverlayLayout(); });
             menu.MenuItems.Add("Clear all colors...", delegate { ClearAll(); });
             menu.MenuItems.Add("Open log", delegate { try { Process.Start("notepad.exe", "\"" + logPath + "\""); } catch { } });
             menu.MenuItems.Add("-");
@@ -3855,8 +4215,8 @@ namespace ZedColors
             tray.ContextMenu = menu;
             tray.Visible = true;
             tray.ShowBalloonTip(4000, "Zed Thread Colors is running",
-                "Right-click this icon for Search, Needs you, and the optional Start with Windows setting.",
-                ToolTipIcon.Info);
+                layoutProblem ?? "Drag the dotted handles to move the prompt bar and GitHub card; resize their edges. Right-click this icon to lock or reset the layout.",
+                layoutProblem == null ? ToolTipIcon.Info : ToolTipIcon.Warning);
             Log("started. script=" + scriptPath);
 
             hotkey = new HotkeyWindow();
@@ -3882,27 +4242,261 @@ namespace ZedColors
             indexer.Start();
 
             ciCard = new CiCard();
+            ciCard.Host = this;
             ci = new CiWatcher(this);
             ci.Start();
         }
 
         // ---------- GitHub Actions card ----------
 
-        public void OnCi() { LayoutCi(); }
+        public void OnCi() { LayoutCi(); LayoutDashboard(); }
 
-        // Right-aligned just under the prompt bar; only while the bar shows and a run is known.
+        // The default GitHub position follows the prompt bar until the card is adjusted.
         void LayoutCi()
         {
             CiInfo c = ci == null ? null : ci.Latest;
             if (c == null || bar == null || !bar.Visible) { if (ciCard != null && ciCard.Visible) ciCard.Hide(); return; }
             ciCard.SetInfo(c, scale);
-            Point at = new Point(bar.Right - ciCard.Width, bar.Bottom + (int)(6 * scale));
-            if (ciCard.Location != at) ciCard.Location = at;
+            if (ciCard.Adjusting) return;
+            PanelPlacement p = overlayLayout.GitHub;
+            Rectangle b = p == null
+                ? new Rectangle(bar.Right - (int)(330 * scale), bar.Bottom + (int)(6 * scale), (int)(330 * scale), (int)(68 * scale))
+                : PlacementBounds(p);
+            b = AdjustableOverlay.ClampBounds(b, OverlayArea, new Size((int)(220 * scale), (int)(68 * scale)));
+            if (b.IsEmpty) { ciCard.Hide(); return; }
+            if (ciCard.Bounds != b) ciCard.Bounds = b;
             if (!ciCard.Visible)
             {
                 if (zedMain != IntPtr.Zero) Native.SetOwner(ciCard.Handle, zedMain);
                 ciCard.Show();
             }
+        }
+
+        public bool OverlayLocked { get { return overlayLayout != null && overlayLayout.Locked; } }
+
+        public Rectangle OverlayArea
+        {
+            get
+            {
+                if (lastClient.IsEmpty) return Rectangle.Empty;
+                Rectangle area = Rectangle.Intersect(lastClient, Screen.FromRectangle(lastClient).WorkingArea);
+                if (form != null && form.Bounds.Right > area.Left)
+                {
+                    int left = Math.Min(area.Right, form.Bounds.Right + (int)(4 * scale));
+                    area = Rectangle.FromLTRB(left, area.Top, area.Right, area.Bottom);
+                }
+                return area;
+            }
+        }
+
+        Rectangle PlacementBounds(PanelPlacement p)
+        {
+            return new Rectangle(lastClient.Left + (int)Math.Round(p.X * scale), lastClient.Top + (int)Math.Round(p.Y * scale),
+                (int)Math.Round(p.Width * scale), (int)Math.Round(p.Height * scale));
+        }
+
+        void ToggleDashboard()
+        {
+            overlayLayout.DashboardEnabled = !overlayLayout.DashboardEnabled;
+            if (dashboardItem != null) dashboardItem.Checked = overlayLayout.DashboardEnabled;
+            SaveOverlayLayout();
+            UpdateDashboard();
+        }
+
+        void LayoutDashboard()
+        {
+            if (dashboard == null) return;
+            Rectangle area = OverlayArea;
+            if (!overlayLayout.DashboardEnabled || !form.Visible || active == null || area.IsEmpty)
+            {
+                if (dashboard.Visible) dashboard.Hide();
+                return;
+            }
+            dashboard.UiScale = scale;
+            if (dashboard.Adjusting) return;
+            PanelPlacement p = overlayLayout.Dashboard;
+            int w = (int)(330 * scale), top = bar.Visible ? bar.Bottom : area.Top + (int)(BarTop * scale);
+            if (ciCard != null && ciCard.Visible) top = Math.Max(top, ciCard.Bottom);
+            Rectangle b = p == null ? new Rectangle((bar.Visible ? bar.Right : area.Right) - w, top + (int)(8 * scale), w, (int)(300 * scale))
+                : PlacementBounds(p);
+            b = AdjustableOverlay.ClampBounds(b, area, new Size((int)(260 * scale), (int)(160 * scale)));
+            if (b.IsEmpty) { dashboard.Hide(); return; }
+            if (dashboard.Bounds != b) dashboard.Bounds = b;
+            if (!dashboard.Visible)
+            {
+                if (zedMain != IntPtr.Zero) Native.SetOwner(dashboard.Handle, zedMain);
+                dashboard.Show();
+            }
+        }
+
+        static string DashboardPreview(string text)
+        {
+            text = Regex.Replace(text ?? "", @"\s+", " ").Trim();
+            return text.Length > 320 ? text.Substring(0, 317) + "..." : text;
+        }
+
+        DashboardData BuildDashboardData()
+        {
+            DashboardData data = new DashboardData();
+            if (active != null)
+            {
+                data.Session = active.Session; data.Thread = active.Display ?? "Current thread";
+                ThreadUsage tu = UsageFor(active.Session);
+                string status = StatusText(tu, out data.StatusColor);
+                ThreadDoc doc = DocFor(active.Session);
+                data.Status = status ?? (doc != null && doc.Problem != null ? doc.Problem : "Waiting for recorded activity...");
+                bool fresh = tu != null && (tu.LastWrite == DateTime.MinValue || (DateTime.Now - tu.LastWrite).TotalMinutes <= 30);
+                if (tu != null && tu.Working && fresh)
+                {
+                    if (!tu.WaitingForHelpers && string.IsNullOrEmpty(tu.AskText)) data.Step = tu.Step ?? "";
+                    data.ActiveHelpers = tu.ActiveHelpers;
+                    data.HelperDescriptions = (string[])tu.HelperDescriptions.Clone();
+                }
+            }
+            Dictionary<string, DashboardAttention> attention = new Dictionary<string, DashboardAttention>();
+            if (needs != null)
+                foreach (NeedItem n in needs)
+                {
+                    if (n.Doc.Info.Session == data.Session || n.Doc.Archived || n.Asks.Count == 0) continue;
+                    ThreadUsage state = UsageFor(n.Doc.Info.Session);
+                    if (state == null || state.Working || state.TurnEnd != n.When || n.When <= SeenAt(n.Doc.Info.Session)) continue;
+                    attention[n.Doc.Info.Session] = new DashboardAttention { Session = n.Doc.Info.Session,
+                        Title = n.Doc.Info.Display + " \u00B7 " + n.Doc.Project, Question = DashboardPreview(n.Asks[0]), When = n.When };
+                }
+            IndexSnapshot ix = IndexSnap;
+            if (ix != null)
+                foreach (ThreadDoc doc in ix.Docs)
+                {
+                    if (doc.Archived || doc.Info.Session == data.Session) continue;
+                    ThreadUsage tu = UsageFor(doc.Info.Session);
+                    if (tu == null || string.IsNullOrWhiteSpace(tu.AskText)) continue;
+                    attention[doc.Info.Session] = new DashboardAttention { Session = doc.Info.Session,
+                        Title = doc.Info.Display + " \u00B7 " + doc.Project, Question = DashboardPreview(tu.AskText), When = tu.AskTime };
+                }
+            List<DashboardAttention> items = new List<DashboardAttention>(attention.Values);
+            items.Sort(delegate (DashboardAttention a, DashboardAttention b) { return b.When.CompareTo(a.When); });
+            data.Attention = items.ToArray();
+            return data;
+        }
+
+        void UpdateDashboard()
+        {
+            if (dashboard == null) return;
+            dashboard.SetData(BuildDashboardData(), scale);
+            LayoutDashboard();
+        }
+
+        public void RememberOverlayBounds(AdjustableOverlay panel, bool verticalResize)
+        {
+            PanelPlacement p;
+            if (panel == bar)
+            {
+                p = overlayLayout.Prompt ?? new PanelPlacement();
+                overlayLayout.Prompt = p;
+                if (verticalResize)
+                {
+                    bar.Expanded = bar.Height > bar.CollapsedHeight + (int)(4 * scale);
+                    p.Height = bar.Height / scale;
+                }
+            }
+            else if (panel == ciCard)
+            {
+                p = overlayLayout.GitHub ?? new PanelPlacement();
+                overlayLayout.GitHub = p;
+                p.Height = panel.Height / scale;
+            }
+            else if (panel == dashboard)
+            {
+                p = overlayLayout.Dashboard ?? new PanelPlacement();
+                overlayLayout.Dashboard = p;
+                p.Height = panel.Height / scale;
+            }
+            else throw new ArgumentException("Unknown overlay panel", "panel");
+            p.X = (panel.Left - lastClient.Left) / scale;
+            p.Y = (panel.Top - lastClient.Top) / scale;
+            p.Width = panel.Width / scale;
+            SaveOverlayLayout();
+            LayoutBar();
+        }
+
+        public void TogglePromptExpansion()
+        {
+            bar.Expanded = !bar.Expanded;
+            LayoutBar();
+        }
+
+        void ToggleOverlayLock()
+        {
+            overlayLayout.Locked = !overlayLayout.Locked;
+            if (layoutLockItem != null) layoutLockItem.Checked = overlayLayout.Locked;
+            bar.Invalidate();
+            if (ciCard != null) ciCard.Invalidate();
+            if (dashboard != null) dashboard.Invalidate();
+            SaveOverlayLayout();
+        }
+
+        public void ResetOverlayLayout()
+        {
+            overlayLayout.Prompt = null; overlayLayout.GitHub = null; overlayLayout.Dashboard = null;
+            bar.Expanded = true;
+            SaveOverlayLayout();
+            LayoutBar();
+        }
+
+        static bool ValidPlacement(PanelPlacement p, bool autoHeight)
+        {
+            return p == null || (!float.IsNaN(p.X) && !float.IsNaN(p.Y) && Math.Abs(p.X) <= 100000 && Math.Abs(p.Y) <= 100000
+                && p.Width > 0 && p.Width <= 100000 && p.Height >= (autoHeight ? 0 : 1) && p.Height <= 100000);
+        }
+
+        void LoadOverlayLayout()
+        {
+            if (!File.Exists(layoutPath)) return;
+            try
+            {
+                OverlayLayout saved = new System.Web.Script.Serialization.JavaScriptSerializer().Deserialize<OverlayLayout>(File.ReadAllText(layoutPath));
+                if (saved == null || !ValidPlacement(saved.Prompt, true) || !ValidPlacement(saved.GitHub, false) || !ValidPlacement(saved.Dashboard, false))
+                    throw new InvalidDataException("Invalid overlay panel bounds");
+                overlayLayout = saved;
+                layoutProblem = null;
+            }
+            catch (IOException e) { LayoutLoadError(e); }
+            catch (InvalidDataException e) { LayoutLoadError(e); }
+            catch (UnauthorizedAccessException e) { LayoutLoadError(e); }
+            catch (ArgumentException e) { LayoutLoadError(e); }
+            catch (InvalidOperationException e) { LayoutLoadError(e); }
+        }
+
+        void LayoutLoadError(Exception e)
+        {
+            layoutProblem = "Saved overlay layout could not be loaded; using default positions. Open log for details.";
+            LogOnce("layout-load", "Could not load overlay layout: " + e.Message);
+        }
+
+        void SaveOverlayLayout()
+        {
+            string temp = layoutPath + ".tmp";
+            try
+            {
+                File.WriteAllText(temp, new System.Web.Script.Serialization.JavaScriptSerializer().Serialize(overlayLayout));
+                if (File.Exists(layoutPath)) File.Replace(temp, layoutPath, null);
+                else File.Move(temp, layoutPath);
+            }
+            catch (IOException e) { LayoutSaveError(e); }
+            catch (UnauthorizedAccessException e) { LayoutSaveError(e); }
+            finally
+            {
+                try { if (File.Exists(temp)) File.Delete(temp); }
+                catch (IOException e) { LogOnce("layout-cleanup", "Could not remove temporary layout file: " + e.Message); }
+                catch (UnauthorizedAccessException e) { LogOnce("layout-cleanup", "Could not remove temporary layout file: " + e.Message); }
+            }
+        }
+
+        void LayoutSaveError(Exception e)
+        {
+            Log("Could not save overlay layout: " + e.Message);
+            MessageBox.Show("Could not save the overlay layout. Changes apply until restart. Open log for details.",
+                "Zed Thread Colors", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
 
         static Icon MakeIcon()
@@ -4198,7 +4792,7 @@ namespace ZedColors
             {
                 promptText = null;
                 navIndex = -1; // new thread: back to showing its latest prompt
-                bar.Expanded = false;
+                bar.Expanded = true;
                 if (indexer != null) indexer.Wake(); // refresh the usage chip for the new thread now
             }
             UpdateChip();
@@ -4311,14 +4905,30 @@ namespace ZedColors
 
         public void LayoutBar()
         {
-            if (!barEnabled || !form.Visible || string.IsNullOrEmpty(promptText) || active == null) { HideBar(); return; }
+            if (!barEnabled || !form.Visible || string.IsNullOrEmpty(promptText) || active == null) { HideBar(); LayoutDashboard(); return; }
             bar.UiScale = scale;
+            if (bar.Adjusting) { LayoutCi(); LayoutDashboard(); return; }
             int x0 = form.Bounds.Right + (int)(10 * scale);
             int x1 = lastClient.Right - (int)(24 * scale);
             int y0 = lastClient.Top + (int)(BarTop * scale);
-            if (x1 - x0 < 200) { HideBar(); return; }
+            if (x1 - x0 < 200) { HideBar(); LayoutDashboard(); return; }
             int h = bar.DesiredHeight(x1 - x0, (int)(lastClient.Height * 0.45));
             Rectangle b = new Rectangle(x0, y0, x1 - x0, h);
+            PanelPlacement p = overlayLayout.Prompt;
+            if (p != null)
+            {
+                b = PlacementBounds(p);
+                b.Height = !bar.Expanded ? bar.CollapsedHeight
+                    : p.Height > 0 ? Math.Max((int)(76 * scale), b.Height)
+                    : bar.DesiredHeight(b.Width, (int)(lastClient.Height * 0.45));
+            }
+            b = AdjustableOverlay.ClampBounds(b, OverlayArea, new Size((int)(360 * scale), bar.CollapsedHeight));
+            if (b.IsEmpty) { HideBar(); LayoutDashboard(); return; }
+            if (bar.Expanded && (p == null || p.Height == 0))
+            {
+                b.Height = bar.DesiredHeight(b.Width, (int)(lastClient.Height * 0.45));
+                b = AdjustableOverlay.ClampBounds(b, OverlayArea, new Size((int)(360 * scale), bar.CollapsedHeight));
+            }
             if (bar.Bounds != b) { bar.Bounds = b; bar.Invalidate(); }
             if (!bar.Visible)
             {
@@ -4327,6 +4937,7 @@ namespace ZedColors
                 bar.Show();
             }
             LayoutCi();
+            LayoutDashboard();
         }
 
         const float BarTop = 62f; // pixels below the top of Zed's window, at 100% scaling
@@ -4354,6 +4965,7 @@ namespace ZedColors
             RefreshPromptMaybe();
             if (search != null && !search.IsDisposed) search.OnIndexUpdated();
             if (peek != null && !peek.IsDisposed && peek.Visible) peek.UpdateContent();
+            UpdateDashboard();
         }
 
         public void OnUsage()
@@ -4614,6 +5226,7 @@ namespace ZedColors
             if (form.NeedsCount != needs.Count) { form.NeedsCount = needs.Count; form.Invalidate(); }
             if (needsForm != null && !needsForm.IsDisposed && needsForm.Visible) needsForm.Rebuild(needs);
             if (peek != null && !peek.IsDisposed && peek.Visible) peek.UpdateContent();
+            UpdateDashboard();
             Notify();
         }
 
@@ -4824,6 +5437,7 @@ namespace ZedColors
                 if (relayout && bar.Expanded) LayoutBar();
                 bar.Invalidate();
             }
+            UpdateDashboard();
         }
 
         // Stepping through prompts with the jump buttons: -1 = showing the latest prompt,
@@ -5141,17 +5755,33 @@ namespace ZedColors
         int FindEdge(int[] px, int w, int h)
         {
             int samples = 48;
+            Rectangle[] panels = new Rectangle[] {
+                bar != null && bar.Visible ? bar.Bounds : Rectangle.Empty,
+                ciCard != null && ciCard.Visible ? ciCard.Bounds : Rectangle.Empty,
+                dashboard != null && dashboard.Visible ? dashboard.Bounds : Rectangle.Empty
+            };
+            for (int i = 0; i < panels.Length; i++)
+            {
+                if (panels[i].IsEmpty) continue;
+                panels[i].Offset(-lastClient.Left, -lastClient.Top);
+                panels[i].Inflate(2, 2);
+            }
             int y0 = (int)(h * 0.08), y1 = (int)(h * 0.97);
             int start = Math.Max(2, (int)(150 * scale));
             for (int x = start; x < w - 1; x++)
             {
-                int count = 0;
+                int count = 0, tested = 0;
                 for (int i = 0; i < samples; i++)
                 {
                     int y = y0 + (y1 - y0) * i / (samples - 1);
+                    // A panel may briefly overlap the sidebar when Zed's panes change.
+                    bool covered = false;
+                    foreach (Rectangle panel in panels) if (panel.Contains(x, y) || panel.Contains(x - 1, y)) { covered = true; break; }
+                    if (covered) continue;
+                    tested++;
                     if (Diff(px[y * w + x - 1], px[y * w + x]) > 30) count++;
                 }
-                if (count >= samples * 0.7) return x;
+                if (tested >= samples * 0.7 && count >= tested * 0.7) return x;
             }
             return -1;
         }
@@ -5235,7 +5865,7 @@ namespace ZedColors
         void KeepInFront()
         {
             if (zedMain == IntPtr.Zero) return;
-            Form[] wins = new Form[] { form, rings, bar, ciCard };
+            Form[] wins = new Form[] { form, rings, bar, ciCard, dashboard };
             foreach (Form w in wins)
                 if (w != null && w.Visible && w.IsHandleCreated && Native.IsBehind(w.Handle, zedMain)) Native.BringToFront(w.Handle);
         }
@@ -5245,6 +5875,7 @@ namespace ZedColors
             if (form != null && form.Visible) form.Hide();
             if (rings != null && rings.Visible) rings.Hide();
             HideBar();
+            if (dashboard != null && dashboard.Visible) dashboard.Hide();
         }
 
         // Our rings sit inside the sidebar and the screen capture sees them. Paint each ring's band
@@ -5284,6 +5915,8 @@ namespace ZedColors
             Native.SetOwner(h, zedMain);
             Native.SetOwner(rings.Handle, zedMain);
             if (bar.IsHandleCreated) Native.SetOwner(bar.Handle, zedMain);
+            if (ciCard != null && ciCard.IsHandleCreated) Native.SetOwner(ciCard.Handle, zedMain);
+            if (dashboard != null && dashboard.IsHandleCreated) Native.SetOwner(dashboard.Handle, zedMain);
             ownerSet = zedMain;
             Log("attached to Zed window " + zedMain);
         }

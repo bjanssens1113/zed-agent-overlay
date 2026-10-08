@@ -50,6 +50,8 @@ try {
     Set-Field $hostApp 'logPath' (Join-Path $temp 'log.txt')
     Set-Field $hostApp 'logWarnings' (New-Object 'System.Collections.Generic.Dictionary[string,string]')
     Set-Field $hostApp 'threads' (New-Object 'System.Collections.Generic.List[ZedColors.ThreadInfo]')
+    Set-Field $hostApp 'overlayLayout' (New-Object ZedColors.OverlayLayout)
+    Set-Field $hostApp 'layoutPath' (Join-Path $temp 'layout.json')
     $indexer = New-Object ZedColors.Indexer($hostApp)
     Set-Field $hostApp 'indexer' $indexer
     Set-Field $indexer 'js' (New-Object System.Web.Script.Serialization.JavaScriptSerializer)
@@ -88,6 +90,8 @@ try {
     $form = New-Object ZedColors.BoxForm
     $rings = New-Object ZedColors.RingForm
     $bar = New-Object ZedColors.PromptBar
+    Assert $bar.Expanded 'Last Prompt must start expanded by default.'
+    $bar.Host = $hostApp
     $forms = @($form, $rings, $bar)
     Set-Field $hostApp 'form' $form
     Set-Field $hostApp 'rings' $rings
@@ -107,8 +111,18 @@ try {
     Set-Field $hostApp 'lastPx' $pixels
     Set-Field $hostApp 'scale' ([single]1)
     Set-Field $hostApp 'barEnabled' $true
+    $bar.Expanded = $false
     $hostApp.OnIndex()
     Assert ((Get-Field $hostApp 'active').Session -eq $session) 'A late database snapshot must re-match the selected new thread without needing another OCR change.'
+    Assert $bar.Expanded 'Opening a thread must expand Last Prompt by default.'
+    $bar.Expanded = $false
+    $null = Invoke-Private $hostApp 'SetActive' (, $info)
+    Assert (-not $bar.Expanded) 'Refreshing the same thread must respect a manual collapse.'
+    $otherInfo = New-Object ZedColors.ThreadInfo
+    $otherInfo.Session = [Guid]::NewGuid().ToString(); $otherInfo.Agent = $info.Agent
+    $null = Invoke-Private $hostApp 'SetActive' (, $otherInfo)
+    Assert $bar.Expanded 'Switching threads must reopen Last Prompt.'
+    $null = Invoke-Private $hostApp 'SetActive' (, $info)
     $null = Invoke-Private $hostApp 'LoadThreads'
     $null = Invoke-Private $hostApp 'UpdateDots'
     Assert ($rings.Dots[$row.Key] -eq 1) 'The newly discovered session must receive a blue working ring.'
@@ -301,6 +315,33 @@ try {
     $event = @{ type = 'tool.execution_complete'; timestamp = $now; data = @{ toolCallId = 'helper-call'; success = $true } }
     $null = Invoke-Private $indexer 'Line' @($copilot, ($event | ConvertTo-Json -Depth 20 -Compress))
     Assert ($copilot.ActiveHelpers -eq 0) 'Copilot helper call completion must clear its dash.'
+    $promptFile = Join-Path $temp 'prompt-provenance.jsonl'
+    $promptEvents = @(
+        @{ type = 'user.message'; timestamp = $now; data = @{ content = 'My actual request' } },
+        @{ type = 'assistant.message'; timestamp = $now; data = @{ content = 'Done'; toolRequests = @() } },
+        @{ type = 'assistant.turn_end'; timestamp = $now; data = @{} },
+        @{ type = 'user.message'; timestamp = $now; data = @{ content = 'Internal helper results'; source = 'agent-example-session' } },
+        @{ type = 'user.message'; timestamp = $now; data = @{ content = 'A nested helper prompt'; parentToolCallId = 'parent-helper' } },
+        @{ type = 'user.message'; timestamp = $now; data = @{ content = '<system_notification>Agent finished</system_notification>' } }
+    )
+    Write-Events $promptFile $promptEvents
+    Assert ([ZedColors.Transcripts]::LastPrompt($promptFile) -eq 'My actual request') 'Agent-injected results, nested messages, and runtime notices must not replace the real last prompt.'
+    $provenance = New-Object ZedColors.FileScan
+    $provenance.Kind = 'copilot'; $provenance.WantText = $true; $provenance.Path = $promptFile
+    foreach ($event in $promptEvents) { $null = Invoke-Private $indexer 'Line' @($provenance, ($event | ConvertTo-Json -Depth 20 -Compress)) }
+    Assert ($provenance.Prompts -eq 1 -and -not $provenance.Working) 'Injected messages must not count as prompts or restart a completed turn.'
+    Assert (@($provenance.Msgs | Where-Object {$_.You}).Count -eq 1) 'Search and prompt navigation must exclude injected messages too.'
+    $named = New-Object ZedColors.FileScan
+    $named.HelperStarted('named-call', 'Review the changes')
+    $named.BackgroundStarted('named-call'); $named.BackgroundLaunched('named-call', 'named-agent')
+    $named.HelperStarted('unknown-call')
+    Assert ($named.ActiveHelpers -eq 2 -and $named.ActiveHelperDescriptions().Length -eq 1) 'Unknown helper descriptions must not be invented.'
+    $named.BackgroundFinished('named-agent') | Out-Null
+    Assert ($named.ActiveHelperDescriptions().Length -eq 0) 'Completed helper descriptions must disappear from the active list.'
+    $named.BackgroundResumed('resume-call', 'named-agent') | Out-Null
+    Assert ($named.ActiveHelperDescriptions()[0] -eq 'Review the changes') 'Resumed Claude helpers must retain their recorded description.'
+    $named.Reset()
+    Assert ($named.HelperDescriptions.Count -eq 0) 'History reset must discard helper descriptions.'
     function Copilot-Event($event) {
         $null = Invoke-Private $indexer 'Line' @($copilot, ($event | ConvertTo-Json -Depth 20 -Compress))
     }
@@ -360,6 +401,229 @@ try {
     $indexer.Index.Docs.Add($missingDoc)
     $null = Invoke-Private $hostApp 'RefreshPrompt'
     Assert ($bar.Prompt -eq $missingDoc.Problem) 'The prompt bar must explain why history is unavailable.'
+
+    $area = New-Object Drawing.Rectangle(100, 80, 900, 600)
+    $minimum = New-Object Drawing.Size(220, 68)
+    $fit = [ZedColors.AdjustableOverlay]::ClampBounds((New-Object Drawing.Rectangle(-200, 900, 1200, 20)), $area, $minimum)
+    Assert ($fit -eq (New-Object Drawing.Rectangle(100, 612, 900, 68))) 'Panel bounds must remain reachable and respect minimum sizes within a smaller window.'
+    $start = New-Object Drawing.Rectangle(300, 200, 400, 120)
+    $resized = [ZedColors.AdjustableOverlay]::GestureBounds($start, (New-Object Drawing.Point(350, 200)), 5, $area, $minimum)
+    Assert ($resized.Right -eq $start.Right -and $resized.Bottom -eq $start.Bottom -and $resized.Size -eq $minimum) 'Top-left resizing must preserve the opposite corner at the minimum size.'
+    $moved = [ZedColors.AdjustableOverlay]::GestureBounds($start, (New-Object Drawing.Point(1000, -1000)), 16, $area, $minimum)
+    Assert ($moved -eq (New-Object Drawing.Rectangle(600, 80, 400, 120))) 'Dragging must clamp the entire panel, including its handle, inside the window.'
+    $ciCard = New-Object ZedColors.CiCard
+    $ciCard.Host = $hostApp; $forms += $ciCard
+    Set-Field $hostApp 'ciCard' $ciCard
+    $ciInfo = New-Object ZedColors.CiInfo
+    $ciInfo.Repo = 'example/sample'; $ciInfo.Workflow = 'Build'; $ciInfo.Status = 'in_progress'
+    $ciInfo.Title = 'A sample workflow title that wraps when the card is enlarged'
+    $ciInfo.StepsDone = 2; $ciInfo.StepsTotal = 4
+    $ciWatcher = New-Object ZedColors.CiWatcher($hostApp)
+    $ciWatcher.Latest = $ciInfo
+    Set-Field $hostApp 'ci' $ciWatcher
+    $oldClient = Get-Field $hostApp 'lastClient'
+    $oldBounds = $form.Bounds
+    $oldPrompt = Get-Field $hostApp 'promptText'
+    $client = New-Object Drawing.Rectangle(80, 80, 1000, 600)
+    Set-Field $hostApp 'lastClient' $client
+    Set-Field $hostApp 'promptText' 'A synthetic prompt for panel layout tests'
+    $bar.Expanded = $false
+    $form.Bounds = New-Object Drawing.Rectangle(80, 80, 180, 600)
+    $form.Show()
+    $hostApp.LayoutBar()
+    Assert ($bar.Visible -and $ciCard.Visible) 'Default panel layouts must retain their existing visibility conditions.'
+    Assert ($ciCard.Right -eq $bar.Right -and $ciCard.Top -eq $bar.Bottom + 6) 'The unadjusted GitHub card must still follow the prompt bar.'
+    function Panel-Gesture($panel, [Drawing.Point]$point, [Drawing.Point]$delta) {
+        $screen = $panel.PointToScreen($point)
+        $null = Invoke-Private $panel 'OnMouseDown' (, (New-Object Windows.Forms.MouseEventArgs([Windows.Forms.MouseButtons]::Left, 1, $point.X, $point.Y, 0)))
+        Assert $panel.Adjusting 'A handle or resize edge must begin a real mouse gesture.'
+        $screen.Offset($delta)
+        $local = $panel.PointToClient($screen)
+        $null = Invoke-Private $panel 'OnMouseMove' (, (New-Object Windows.Forms.MouseEventArgs([Windows.Forms.MouseButtons]::Left, 0, $local.X, $local.Y, 0)))
+        $during = $panel.Bounds
+        $hostApp.LayoutBar()
+        Assert ($panel.Bounds -eq $during) 'An asynchronous refresh must not overwrite a panel during a gesture.'
+        $local = $panel.PointToClient($screen)
+        $null = Invoke-Private $panel 'OnMouseUp' (, (New-Object Windows.Forms.MouseEventArgs([Windows.Forms.MouseButtons]::Left, 1, $local.X, $local.Y, 0)))
+        Assert (-not $panel.Adjusting) 'Mouse release must finish the adjustment.'
+    }
+    $dashboard = New-Object ZedColors.DashboardPanel
+    $dashboard.Host = $hostApp; $forms += $dashboard
+    Set-Field $hostApp 'dashboard' $dashboard
+    $currentUsage = New-Object ZedColors.ThreadUsage
+    $currentUsage.HasTurn = $true; $currentUsage.TurnStart = [DateTime]::Now.AddMinutes(-1)
+    $indexer.Usage.BySession[$session] = $currentUsage
+    $currentUsage.Working = $true; $currentUsage.LastWrite = [DateTime]::Now
+    $currentUsage.Step = 'Editing the sample'; $currentUsage.ActiveHelpers = 2
+    $currentUsage.HelperDescriptions = @('review-demo: Review changes')
+    $otherDoc = New-Object ZedColors.ThreadDoc
+    $otherDoc.Info = New-Object ZedColors.ThreadInfo
+    $otherDoc.Info.Session = 'other-dashboard'; $otherDoc.Info.Display = 'Another thread'; $otherDoc.Project = 'Another project'
+    $otherUsage = New-Object ZedColors.ThreadUsage
+    $otherUsage.AskText = 'Can you approve this change?'; $otherUsage.AskTime = [DateTime]::Now
+    $indexer.Index.Docs.Add($otherDoc); $indexer.Usage.BySession[$otherDoc.Info.Session] = $otherUsage
+    $null = Invoke-Private $hostApp 'UpdateDashboard'
+    Assert ($dashboard.Visible -and $dashboard.Data.Step -eq 'Editing the sample') 'The dashboard must show snapshot-based current activity.'
+    Assert ($dashboard.Data.ActiveHelpers -eq 2 -and $dashboard.Data.HelperDescriptions.Length -eq 1) 'The dashboard must preserve exact counts with only recorded helper descriptions.'
+    Assert ($dashboard.Data.Attention.Length -eq 1 -and $dashboard.Data.Attention[0].Session -eq 'other-dashboard') 'Other threads with recorded open questions must appear in the dashboard.'
+    $otherDoc.Archived = $true
+    $null = Invoke-Private $hostApp 'UpdateDashboard'
+    Assert ($dashboard.Data.Attention.Length -eq 0) 'Archived threads must not appear as needing attention.'
+    $otherDoc.Archived = $false; $otherUsage.AskText = $null
+    $currentUsage.LastWrite = [DateTime]::Now.AddMinutes(-31)
+    $null = Invoke-Private $hostApp 'UpdateDashboard'
+    Assert ($dashboard.Data.ActiveHelpers -eq 0 -and $dashboard.Data.Step.Length -eq 0) 'Stale activity must not claim live helpers or current work.'
+    $currentUsage.LastWrite = [DateTime]::Now
+    $null = Invoke-Private $hostApp 'UpdateDashboard'
+    $dashboard.Bounds = New-Object Drawing.Rectangle(300, 250, 330, 200)
+    $hostApp.RememberOverlayBounds($dashboard, $false)
+    Panel-Gesture $dashboard (New-Object Drawing.Point(14, 16)) (New-Object Drawing.Point(30, 10))
+    Panel-Gesture $dashboard (New-Object Drawing.Point(($dashboard.Width - 2), ($dashboard.Height - 2))) (New-Object Drawing.Point(40, 50))
+    $dashboardBounds = $dashboard.Bounds
+    $image = New-Object Drawing.Bitmap($dashboard.Width, $dashboard.Height)
+    try { $dashboard.DrawToBitmap($image, (New-Object Drawing.Rectangle(0, 0, $image.Width, $image.Height))) }
+    finally { $image.Dispose() }
+    Assert ((Get-Field $dashboard 'contentHeight') -gt 0) 'Dashboard sections must render actual content.'
+    $scrollData = New-Object ZedColors.DashboardData
+    $scrollData.Session = $session; $scrollData.Status = 'Working'; $scrollData.ActiveHelpers = 12
+    $scrollData.HelperDescriptions = @(1..12 | ForEach-Object { "Recorded helper $_ reviewing a separate task" })
+    $dashboard.SetData($scrollData, 1)
+    $image = New-Object Drawing.Bitmap($dashboard.Width, $dashboard.Height)
+    try { $dashboard.DrawToBitmap($image, (New-Object Drawing.Rectangle(0, 0, $image.Width, $image.Height))) }
+    finally { $image.Dispose() }
+    Assert ((Get-Field $dashboard 'contentHeight') -gt $dashboard.Height) 'Long helper lists must remain accessible rather than disappearing below the panel.'
+    $mouse = New-Object Windows.Forms.MouseEventArgs([Windows.Forms.MouseButtons]::None, 0, 100, 100, -120)
+    $null = Invoke-Private $dashboard 'OnMouseWheel' (, $mouse)
+    Assert ((Get-Field $dashboard 'scroll') -gt 0) 'The dashboard must scroll when content exceeds the chosen height.'
+    $null = Invoke-Private $hostApp 'UpdateDashboard'
+    $hostApp.LayoutBar()
+    Assert ($dashboard.Bounds -eq $dashboardBounds) 'Refreshes must preserve independent dashboard placement and size.'
+    $null = Invoke-Private $hostApp 'ToggleDashboard'
+    Assert (-not $dashboard.Visible) 'The dashboard must have an independent hide control.'
+    $null = Invoke-Private $hostApp 'ToggleDashboard'
+    Assert $dashboard.Visible 'The dashboard must be restorable without changing other panels.'
+    $before = $bar.Bounds
+    Panel-Gesture $bar (New-Object Drawing.Point(14, 16)) (New-Object Drawing.Point(0, 90))
+    Assert ($bar.Top -eq $before.Top + 90 -and -not $bar.Expanded) 'Dragging the prompt handle must move without expanding or activating its click action.'
+    Panel-Gesture $bar (New-Object Drawing.Point(($bar.Width - 2), ($bar.Height - 2))) (New-Object Drawing.Point(-200, 90))
+    Assert ($bar.Width -eq $before.Width - 200 -and $bar.Height -eq 128 -and $bar.Expanded) 'Prompt resizing must change width and height and expose wrapped text.'
+    Panel-Gesture $ciCard (New-Object Drawing.Point(14, 16)) (New-Object Drawing.Point(-100, 60))
+    Panel-Gesture $ciCard (New-Object Drawing.Point(($ciCard.Width - 2), ($ciCard.Height - 2))) (New-Object Drawing.Point(70, 80))
+    $ciBounds = $ciCard.Bounds
+    $ciCard.SetInfo($ciInfo, 1)
+    Assert ($ciCard.Bounds -eq $ciBounds) 'GitHub polling must not reset the user-selected card size.'
+    $bar.Top += 20
+    $hostApp.RememberOverlayBounds($bar, $false)
+    Assert ($ciCard.Bounds -eq $ciBounds) 'An adjusted GitHub card must be independent of subsequent prompt-bar movement.'
+    $savedPrompt = (Get-Field $hostApp 'overlayLayout').Prompt
+    $savedHeight = $savedPrompt.Height
+    $hostApp.TogglePromptExpansion()
+    Assert ($bar.Height -eq $bar.CollapsedHeight -and $savedPrompt.Height -eq $savedHeight) 'Collapsing must preserve the chosen expanded height.'
+    $hostApp.TogglePromptExpansion()
+    Assert ($bar.Height -eq $savedHeight) 'Expanding must restore the chosen height.'
+    $mouse = New-Object Windows.Forms.MouseEventArgs([Windows.Forms.MouseButtons]::Left, 1, 14, 16, 0)
+    $null = Invoke-Private $bar 'OnMouseDown' (, $mouse)
+    $mouse = New-Object Windows.Forms.MouseEventArgs([Windows.Forms.MouseButtons]::Left, 0, 14, 26, 0)
+    $null = Invoke-Private $bar 'OnMouseMove' (, $mouse)
+    $bar.Capture = $false
+    Assert (-not $bar.Adjusting) 'Losing mouse capture must finish and save an adjustment.'
+    $mouse = New-Object Windows.Forms.MouseEventArgs([Windows.Forms.MouseButtons]::Left, 1, 14, 16, 0)
+    $null = Invoke-Private $bar 'OnMouseUp' (, $mouse)
+    Assert $bar.Expanded 'A release after capture loss must not activate the prompt body click.'
+    $promptBounds = $bar.Bounds
+    $ciBounds = $ciCard.Bounds
+    Set-Field $hostApp 'lastClient' (New-Object Drawing.Rectangle(80, 80, 600, 300))
+    $hostApp.LayoutBar()
+    Assert ($hostApp.OverlayArea.Contains($bar.Bounds) -and $hostApp.OverlayArea.Contains($ciCard.Bounds)) 'Both panels must remain reachable when Zed becomes smaller.'
+    Assert ($savedPrompt.Width -eq $promptBounds.Width -and $savedPrompt.Height -eq $promptBounds.Height) 'Temporary clamping must not overwrite remembered sizes.'
+    Set-Field $hostApp 'lastClient' $client
+    $hostApp.LayoutBar()
+    Assert ($bar.Bounds -eq $promptBounds -and $ciCard.Bounds -eq $ciBounds) 'The chosen layouts must return when Zed becomes larger again.'
+    $shiftedClient = New-Object Drawing.Rectangle(($client.X + 20), ($client.Y + 10), $client.Width, $client.Height)
+    $shiftedSidebar = $form.Bounds; $shiftedSidebar.Offset(20, 10)
+    Set-Field $hostApp 'lastClient' $shiftedClient
+    $form.Bounds = $shiftedSidebar
+    $hostApp.LayoutBar()
+    $expectedPrompt = New-Object Drawing.Rectangle(($promptBounds.X + 20), ($promptBounds.Y + 10), $promptBounds.Width, $promptBounds.Height)
+    $expectedCi = New-Object Drawing.Rectangle(($ciBounds.X + 20), ($ciBounds.Y + 10), $ciBounds.Width, $ciBounds.Height)
+    Assert ($bar.Bounds -eq $expectedPrompt -and $ciCard.Bounds -eq $expectedCi) 'Both independent panels must follow Zed window movement.'
+    Set-Field $hostApp 'lastClient' $client
+    $form.Bounds = New-Object Drawing.Rectangle(80, 80, 180, 600)
+    $hostApp.LayoutBar()
+    $null = Invoke-Private $hostApp 'ToggleOverlayLock'
+    $lockedBounds = $bar.Bounds
+    $null = Invoke-Private $bar 'OnMouseDown' (, (New-Object Windows.Forms.MouseEventArgs([Windows.Forms.MouseButtons]::Left, 1, 14, 16, 0)))
+    Assert (-not $bar.Adjusting) 'Locked handles must not start moving.'
+    $null = Invoke-Private $bar 'OnMouseUp' (, (New-Object Windows.Forms.MouseEventArgs([Windows.Forms.MouseButtons]::Left, 1, 14, 16, 0)))
+    Assert ($bar.Bounds -eq $lockedBounds -and $bar.Expanded) 'A locked handle must not trigger expansion.'
+    foreach ($expectedExpanded in @($false, $true)) {
+        $mouse = New-Object Windows.Forms.MouseEventArgs([Windows.Forms.MouseButtons]::Left, 1, 30, 16, 0)
+        $null = Invoke-Private $bar 'OnMouseDown' (, $mouse)
+        $null = Invoke-Private $bar 'OnMouseUp' (, $mouse)
+        Assert ($bar.Expanded -eq $expectedExpanded -and $hostApp.OverlayLocked) 'Locking the layout must preserve ordinary prompt expand/collapse clicks.'
+    }
+    Set-Field $hostApp 'overlayLayout' (New-Object ZedColors.OverlayLayout)
+    $layoutFile = Join-Path $temp 'layout.json'
+    $legacyLayout = [IO.File]::ReadAllText($layoutFile) -replace '^\{', '{"PromptExpanded":false,'
+    [IO.File]::WriteAllText($layoutFile, $legacyLayout)
+    $null = Invoke-Private $hostApp 'LoadOverlayLayout'
+    $saved = Get-Field $hostApp 'overlayLayout'
+    Assert ($saved.Locked -and $saved.Prompt.Width -eq $bar.Width -and $saved.GitHub.Height -eq $ciCard.Height) 'Positions, sizes, and locking must survive loading, including older layouts with a collapsed-state preference.'
+    Assert ($saved.DashboardEnabled -and $saved.Dashboard.Width -eq $dashboardBounds.Width -and $saved.Dashboard.Height -eq $dashboardBounds.Height) 'Dashboard placement, size, and visibility must survive layout reload.'
+    Assert (-not [IO.File]::Exists((Join-Path $temp 'layout.json.tmp'))) 'Atomic layout saving must leave no temporary file.'
+    Set-Field $hostApp 'scale' ([single]1.5)
+    $scaled = Invoke-Private $hostApp 'PlacementBounds' (, $saved.Prompt)
+    Assert ($scaled.X -eq $client.X + [Math]::Round($saved.Prompt.X * 1.5) -and $scaled.Width -eq [Math]::Round($saved.Prompt.Width * 1.5)) 'Remembered layouts must scale their Zed-relative position and size with DPI.'
+    Set-Field $hostApp 'scale' ([single]1)
+    foreach ($panel in @($bar, $ciCard, $dashboard)) {
+        $cp = $panel.GetType().GetProperty('CreateParams', [Reflection.BindingFlags]'Instance, NonPublic').GetValue($panel)
+        Assert (($cp.ExStyle -band 0x08000000) -ne 0) 'Adjustable panels must not activate over Zed while interacting.'
+        $image = New-Object Drawing.Bitmap($panel.Width, $panel.Height)
+        try { $panel.DrawToBitmap($image, (New-Object Drawing.Rectangle(0, 0, $image.Width, $image.Height))) }
+        finally { $image.Dispose() }
+        $null = Invoke-Private $panel 'OnMouseDown' (, (New-Object Windows.Forms.MouseEventArgs([Windows.Forms.MouseButtons]::Left, 1, ($panel.Width - 2), ($panel.Height - 2), 0)))
+        Assert (-not $panel.Adjusting) 'Locked resize corners must remain inactive.'
+        $null = Invoke-Private $panel 'OnMouseUp' (, (New-Object Windows.Forms.MouseEventArgs([Windows.Forms.MouseButtons]::Left, 1, ($panel.Width - 2), ($panel.Height - 2), 0)))
+    }
+    $bar.Size = New-Object Drawing.Size(360, 38)
+    $bar.Expanded = $false; $bar.Chip = 'Premium: 100 | Today: 10000 prompts'
+    $bar.Status = 'Waiting for 6 helper agents'; $bar.NavLabel = '10000 of 10001'
+    $image = New-Object Drawing.Bitmap(360, 38)
+    try { $bar.DrawToBitmap($image, (New-Object Drawing.Rectangle(0, 0, 360, 38))) }
+    finally { $image.Dispose() }
+    $buttons = Get-Field $bar 'btnRects'
+    for ($i = 0; $i -lt 3; $i++) {
+        Assert ($bar.ClientRectangle.Contains($buttons[$i]) -and $buttons[$i].Left -ge 28) 'Narrow prompt layouts must keep navigation controls clear of the drag handle.'
+        $center = New-Object Drawing.Point(($buttons[$i].Left + 10), ($buttons[$i].Top + 10))
+        Assert ((Invoke-Private $bar 'ButtonAt' (, $center)) -eq $i) 'Resizing must preserve navigation button hit targets.'
+    }
+    $rowPixels = New-Object 'int[]' 600
+    for ($x = 0; $x -lt 600; $x++) { $rowPixels[$x] = if ($x -lt 300) { 0x111111 } else { 0x555555 } }
+    $cleanPixels = New-Object 'int[]' 360000
+    for ($y = 0; $y -lt 600; $y++) { [Array]::Copy($rowPixels, 0, $cleanPixels, ($y * 600), 600) }
+    $coveredPixels = $cleanPixels.Clone()
+    for ($x = 180; $x -lt 500; $x++) { $rowPixels[$x] = 0xaaaaaa }
+    for ($y = 0; $y -lt 550; $y++) { [Array]::Copy($rowPixels, 0, $coveredPixels, ($y * 600), 600) }
+    $bar.Bounds = New-Object Drawing.Rectangle(260, 80, 320, 550)
+    $edge = Invoke-Private $hostApp 'FindEdge' @($coveredPixels, 600, 600)
+    Assert ($edge -eq -1) 'A tall moved panel covering a resized sidebar must not become a false sidebar edge.'
+    $bar.Hide(); $ciCard.Hide(); $dashboard.Hide()
+    $edge = Invoke-Private $hostApp 'FindEdge' @($cleanPixels, 600, 600)
+    Assert ($edge -eq 300) 'Sidebar detection must recover on an unobstructed capture.'
+    $hostApp.ResetOverlayLayout()
+    Assert ($null -eq $saved.Prompt -and $null -eq $saved.GitHub -and $null -eq $saved.Dashboard -and $bar.Expanded -and $saved.Locked) 'Reset must restore all default placements with Last Prompt expanded, while preserving the lock preference.'
+    Assert ([IO.File]::ReadAllText($layoutFile) -notmatch 'PromptExpanded') 'A temporary collapse must not be persisted as the startup default.'
+    [IO.File]::WriteAllText((Join-Path $temp 'layout.json'), '{"Prompt":{"X":0,"Y":0,"Width":-10,"Height":20}}')
+    $null = Invoke-Private $hostApp 'LoadOverlayLayout'
+    Assert ($null -ne (Get-Field $hostApp 'layoutProblem')) 'Invalid saved geometry must be reported explicitly.'
+    Assert ($null -eq (Get-Field $hostApp 'overlayLayout').Prompt) 'Invalid geometry must not replace the default layout.'
+    $form.Hide(); $bar.Hide(); $ciCard.Hide(); $dashboard.Hide()
+    Set-Field $hostApp 'dashboard' $null
+    (Get-Field $ciWatcher 'wake').Dispose()
+    Set-Field $hostApp 'ci' $null
+    Set-Field $hostApp 'lastClient' $oldClient
+    Set-Field $hostApp 'promptText' $oldPrompt
+    $form.Bounds = $oldBounds
 
     $legacy = Join-Path $temp 'legacy.json'
     [IO.File]::WriteAllText($legacy, '[{"role":"user","content":"Legacy prompt"}]')
@@ -466,7 +730,7 @@ try {
     Assert ($script:app.Retries -eq 1) 'Only the invalid window target should require an OCR retry.'
     Assert ($script:app.Captures -eq 3) 'A continuously changing sidebar must apply OCR before taking its next capture.'
     $null = [xml]([IO.File]::ReadAllText((Join-Path $root 'docs\overlay-preview.svg')))
-    'Passed: compilation, helper counts and six-dash rendering with overflow, working/waiting status, new-session ring, completion colors, Claude background lifecycles, cached prompts, history errors, JSON fallback, startup opt-in, responsive OCR, and preview SVG.'
+    'Passed: compilation, dashboard activity/helpers/attention and scrolling, real-prompt filtering, panel drag/resize, independent placement, saved layouts, DPI, locking/reset, helper counts and rendering, working/waiting status, new-session ring, completion colors, Claude background lifecycles, cached prompts, history errors, JSON fallback, startup opt-in, responsive OCR, and preview SVG.'
 } finally {
     if ($null -ne $timer) { $timer.Stop(); $timer.Dispose() }
     if ($null -ne $worker) { $worker.Stop(); $worker.Dispose() }
