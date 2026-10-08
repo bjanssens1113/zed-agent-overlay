@@ -14,7 +14,8 @@
     <rect x="14" y="134" width="252" height="57" rx="8" fill="#272d38" stroke="#72cffe" stroke-width="2"/>
     <rect x="20" y="144" width="5" height="37" rx="2" fill="#debffe"/>
     <text x="37" y="158" font-size="14" fill="#cccac2">Improve the landing page</text>
-    <text x="37" y="178" font-size="11" fill="#72cffe">Claude / Working</text>
+    <text x="37" y="178" font-size="11" fill="#72cffe">Claude / Working with 3 helpers</text>
+    <path d="M20 195h40m15 0h40m15 0h40" stroke="#72cffe" stroke-width="3"/>
     <rect x="14" y="202" width="252" height="57" rx="8" fill="none" stroke="#ffcc66" stroke-width="2"/>
     <rect x="20" y="212" width="5" height="37" rx="2" fill="#95e5cb"/>
     <text x="37" y="226" font-size="14" fill="#cccac2">Choose a deployment target</text>
@@ -28,6 +29,7 @@
     <text x="24" y="480" font-size="12" fill="#72cffe">Blue: working</text>
     <text x="24" y="503" font-size="12" fill="#ffcc66">Amber: waiting on you</text>
     <text x="24" y="526" font-size="12" fill="#d5ff80">Green: newly finished</text>
+    <text x="24" y="549" font-size="12" fill="#72cffe">Dashes: active helper agents</text>
     <text x="302" y="76" font-size="14" fill="#cccac2">Improve the landing page</text>
     <rect x="300" y="93" width="716" height="89" rx="6" fill="#272d38" stroke="#3b4252"/>
     <text x="315" y="116" font-size="11" fill="#72cffe">Read 4 files / edited 2 files</text>

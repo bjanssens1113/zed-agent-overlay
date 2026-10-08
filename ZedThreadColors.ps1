@@ -4,7 +4,9 @@
 #   Right-click a bar : clear color
 #   Each thread's "box" is a tall color bar beside its row in the sidebar.
 #   Ring around the thread's row: blue (pulsing) = agent working, green = finished since you
-#   last opened the thread. Clicks pass straight through the ring to Zed.
+#   last opened the thread (or a five-second green flash if already open).
+#   Clicks pass straight through the ring to Zed.
+#   Blue dashes below a ring show active helper agents (up to six dashes, then +).
 #   Rest the mouse on a thread in the sidebar for a card with its status, your last prompt, and usage.
 # Needs you: an amber (pulsing) ring when an agent asks you a question; a Windows notification when a
 #   thread asks you something or finishes while you're not looking at it. The bell button under the
@@ -439,6 +441,8 @@ namespace ZedColors
     {
         public List<Row> Rows = new List<Row>();
         public Dictionary<string, int> Dots = new Dictionary<string, int>(); // row key -> 1 working, 2 done
+        public Dictionary<string, int> ActiveHelpers = new Dictionary<string, int>();
+        public const int MaxHelperDashes = 6;
         System.Windows.Forms.Timer pulse;
         DateTime t0 = DateTime.Now;
 
@@ -456,6 +460,27 @@ namespace ZedColors
         public RectangleF RingRect(Row r)
         {
             return new RectangleF(Px(3) + 0.5f, r.RowTop - Top + 0.5f, Width - Px(6) - 1, r.RowBottom - r.RowTop - 1);
+        }
+
+        public RectangleF[] HelperRects(Row r)
+        {
+            int count;
+            if (!ActiveHelpers.TryGetValue(r.Key, out count) || count <= 0) return new RectangleF[0];
+            int n = Math.Min(count, MaxHelperDashes), gap = Px(6);
+            RectangleF ring = RingRect(r);
+            float available = ring.Width - Px(8) - (count > MaxHelperDashes ? Px(12) : 0);
+            float width = Math.Min(Px(30), (available - gap * (n - 1)) / n);
+            if (width <= 0) return new RectangleF[0];
+            RectangleF[] bars = new RectangleF[n];
+            for (int i = 0; i < n; i++)
+                bars[i] = new RectangleF(ring.X + Px(4) + i * (width + gap), ring.Bottom + Px(3), width, Math.Max(2, Px(3)));
+            return bars;
+        }
+
+        public Rectangle HelperBand(Row r)
+        {
+            RectangleF ring = RingRect(r);
+            return Rectangle.Ceiling(new RectangleF(ring.X, ring.Bottom + Px(2), ring.Width, Px(12)));
         }
 
         public bool AnyRings()
@@ -494,6 +519,14 @@ namespace ZedColors
                     }
                     using (Pen pen = new Pen(Color.FromArgb(live ? (int)(170 + 85 * breathe) : 235, c), PenW)) g.DrawPath(pen, p);
                 }
+                RectangleF[] bars = HelperRects(r);
+                using (SolidBrush brush = new SolidBrush(Theme.Working))
+                    foreach (RectangleF b in bars) g.FillRectangle(brush, b);
+                int helpers;
+                if (bars.Length > 0 && ActiveHelpers.TryGetValue(r.Key, out helpers) && helpers > MaxHelperDashes)
+                    using (Font font = new Font(Theme.UiFont, 11f * UiScale, FontStyle.Bold, GraphicsUnit.Pixel))
+                        using (SolidBrush brush = new SolidBrush(Theme.Working))
+                            g.DrawString("+", font, brush, bars[bars.Length - 1].Right + Px(3), bars[0].Top - Px(4));
             }
             if (working && !pulse.Enabled) pulse.Start();
             if (!working && pulse.Enabled) pulse.Stop();
@@ -515,6 +548,13 @@ namespace ZedColors
                 int o = (int)Math.Ceiling(PenW / 2 + GlowW + 2), i = (int)Math.Ceiling(PenW / 2 + 2);
                 outer.Inflate(o, o);
                 inner.Inflate(-i, -i);
+                int helpers;
+                if (ActiveHelpers.TryGetValue(r.Key, out helpers) && helpers > 0)
+                {
+                    Rectangle band = HelperBand(r);
+                    band.Offset(Left, Top);
+                    outer = Rectangle.Union(outer, band);
+                }
                 l.Add(new Rectangle[] { outer, inner });
             }
             return l;
@@ -1241,6 +1281,10 @@ namespace ZedColors
 
         // What the agent did this turn, in plain words (counts reset when a new turn starts).
         public int Reads, Commands, Searches, Helpers;
+        public HashSet<string> HelperTasks = new HashSet<string>();
+        public Dictionary<string, string> HelperTools = new Dictionary<string, string>();
+        public bool WaitingForBackground;
+        public int ActiveHelpers { get { return HelperTasks.Count; } }
         public List<string> Edited = new List<string>();
         public string Step = "";            // the latest step, e.g. "Editing App.jsx"
 
@@ -1259,6 +1303,7 @@ namespace ZedColors
 
         public void StartTurn(DateTime t)
         {
+            WaitingForBackground = false;
             AskText = null; // you replied
             if (!Working || TurnStart == DateTime.MinValue)
             {
@@ -1270,6 +1315,7 @@ namespace ZedColors
 
         public void Did(string kind, string target, string label)
         {
+            WaitingForBackground = false;
             if (askClearsOnStep) AskText = null; // the agent moved on, so the question was answered
             if (kind == "read") Reads++;
             else if (kind == "command") Commands++;
@@ -1297,15 +1343,74 @@ namespace ZedColors
             return char.ToUpper(s[0]) + s.Substring(1);
         }
 
-        // Claude: background commands, monitors and helper agents still running. Claude ends its turn
-        // while they run and picks up again when each one reports back, so it isn't done yet.
-        public int Background;
-        public DateTime PausedAt = DateTime.MinValue; // when Claude ended its turn to wait on background work
+        // Background work can outlive the main agent's turn.
+        public HashSet<string> BackgroundTasks = new HashSet<string>();
+        public Dictionary<string, string> BackgroundTools = new Dictionary<string, string>();
+        public Dictionary<string, string> BackgroundStops = new Dictionary<string, string>();
+        public int Background { get { return BackgroundTasks.Count; } }
+
+        public void HelperStarted(string tool)
+        {
+            if (string.IsNullOrEmpty(tool) || HelperTools.ContainsKey(tool)) return;
+            HelperTools[tool] = tool;
+            HelperTasks.Add(tool);
+        }
+
+        public void HelperLaunched(string tool, string task)
+        {
+            string old;
+            if (string.IsNullOrEmpty(task) || !HelperTools.TryGetValue(tool, out old) || !HelperTasks.Remove(old)) return;
+            HelperTools[tool] = task;
+            HelperTasks.Add(task);
+        }
+
+        public void HelperFinished(string task)
+        {
+            if (string.IsNullOrEmpty(task)) return;
+            string id;
+            if (HelperTools.TryGetValue(task, out id)) task = id;
+            HelperTasks.Remove(task);
+        }
+
+        public void BackgroundStarted(string tool)
+        {
+            if (string.IsNullOrEmpty(tool) || BackgroundTools.ContainsKey(tool)) return;
+            BackgroundTools[tool] = tool;
+            BackgroundTasks.Add(tool);
+        }
+
+        public void BackgroundLaunched(string tool, string task)
+        {
+            string old;
+            if (string.IsNullOrEmpty(task) || !BackgroundTools.TryGetValue(tool, out old)) return;
+            if (!BackgroundTasks.Remove(old)) return;
+            BackgroundTools[tool] = task;
+            BackgroundTasks.Add(task);
+            HelperLaunched(tool, task);
+        }
+
+        public bool BackgroundFinished(string task)
+        {
+            if (string.IsNullOrEmpty(task)) return false;
+            string id;
+            if (BackgroundTools.TryGetValue(task, out id)) task = id;
+            HelperFinished(task);
+            return BackgroundTasks.Remove(task);
+        }
+
+        public bool BackgroundResumed(string tool, string task)
+        {
+            if (string.IsNullOrEmpty(tool) || string.IsNullOrEmpty(task) || BackgroundTools.ContainsKey(tool)) return false;
+            HelperStarted(tool);
+            BackgroundStarted(tool);
+            BackgroundLaunched(tool, task);
+            return true;
+        }
 
         // The agent picked up again without a new prompt from you (e.g. a background task reported back).
         public void Resume(DateTime t)
         {
-            PausedAt = DateTime.MinValue;
+            WaitingForBackground = false;
             if (Working) return;
             Working = true; HasTurn = true;
             if (TurnStart == DateTime.MinValue) TurnStart = t;
@@ -1314,8 +1419,9 @@ namespace ZedColors
         public void EndTurn(DateTime t)
         {
             if (t == DateTime.MinValue) return;
+            WaitingForBackground = false;
+            if (Background == 0) HelperTasks.Clear();
             if (askClearsOnStep) AskText = null;
-            PausedAt = DateTime.MinValue;
             HasTurn = true; Working = false; TurnEnd = t;
         }
 
@@ -1329,7 +1435,9 @@ namespace ZedColors
             IdTok = new Dictionary<string, long>(); IdDay = new Dictionary<string, DateTime>();
             CodexTotal = -1; Primary = null; Secondary = null; Plan = null; RateTime = DateTime.MinValue;
             PremiumMax = 0; Prompts = 0;
-            AskText = null; AskTime = DateTime.MinValue; Background = 0; PausedAt = DateTime.MinValue;
+            AskText = null; AskTime = DateTime.MinValue;
+            BackgroundTasks.Clear(); BackgroundTools.Clear(); BackgroundStops.Clear();
+            HelperTasks.Clear(); HelperTools.Clear(); WaitingForBackground = false;
             PremDay = new Dictionary<DateTime, int>(); PromptDay = new Dictionary<DateTime, int>();
         }
     }
@@ -1356,6 +1464,8 @@ namespace ZedColors
     {
         public long Tokens = -1; public int Premium = -1; public int Prompts;
         public bool HasTurn, Working;
+        public int ActiveHelpers;
+        public bool WaitingForHelpers;
         public DateTime TurnStart = DateTime.MinValue, TurnEnd = DateTime.MinValue, LastWrite = DateTime.MinValue;
         public string Summary = "", Step = "";
         public string AskText;                       // open question to you, or null
@@ -1754,11 +1864,61 @@ namespace ZedColors
             bool asst = Has(s, "\"assistant\"");
             bool intr = Has(s, "[Request interrupted");
             bool user = f.WantText && Has(s, "\"user\"") && (!Has(s, "\"tool_result\"") || intr);
-            if (!asst && !user) return;
+            bool background = f.WantText && (Has(s, "\"tool_result\"") || (Has(s, "task-notification") && Has(s, "\"queued_command\"")));
+            if (!asst && !user && !background) return;
             Dictionary<string, object> d = Parse(s);
             if (d == null) return;
             string type = J.S(d, "type");
             DateTime t = Ts(d);
+            if (f.WantText && !J.B(d, "isSidechain"))
+            {
+                string notification = null;
+                if (type == "attachment")
+                {
+                    Dictionary<string, object> a = J.D(d, "attachment");
+                    if (a != null && J.S(a, "type") == "queued_command") notification = J.S(a, "prompt");
+                }
+                else if (type == "user")
+                {
+                    Dictionary<string, object> m = J.D(d, "message");
+                    object c;
+                    if (m != null && m.TryGetValue("content", out c)) notification = Transcripts.AgentText(c, MaxText);
+                    Dictionary<string, object> result = J.D(d, "toolUseResult");
+                    object[] items = m == null ? null : J.A(m, "content");
+                    if (items != null)
+                        foreach (object o in items)
+                        {
+                            Dictionary<string, object> item = o as Dictionary<string, object>;
+                            if (item == null || J.S(item, "type") != "tool_result") continue;
+                            string tool = J.S(item, "tool_use_id");
+                            if (tool == null) continue;
+                            string stopped;
+                            if (f.BackgroundStops.TryGetValue(tool, out stopped))
+                            {
+                                if (!J.B(item, "is_error") && (result == null || !result.ContainsKey("success") || J.B(result, "success")))
+                                    f.BackgroundFinished(stopped);
+                            }
+                            else if (J.B(item, "is_error")) f.BackgroundFinished(tool);
+                            else if (result != null)
+                            {
+                                string task = J.S(result, "agentId") ?? J.S(result, "backgroundTaskId") ?? J.S(result, "taskId");
+                                if (J.B(result, "isAsync") && f.HelperTools.ContainsKey(tool)) f.BackgroundStarted(tool);
+                                f.BackgroundLaunched(tool, task);
+                                if (J.B(result, "success") && f.BackgroundResumed(tool, J.S(result, "resumedAgentId"))) f.Resume(t);
+                            }
+                            if (J.B(item, "is_error") || (result == null && !f.BackgroundTools.ContainsKey(tool))
+                                || (result != null && !J.B(result, "isAsync") && J.S(result, "resumedAgentId") == null))
+                                f.HelperFinished(tool);
+                        }
+                }
+                if (notification != null && notification.IndexOf("<task-notification", StringComparison.Ordinal) >= 0)
+                {
+                    Match id = Regex.Match(notification, @"<task-id>\s*([^<]+)\s*</task-id>");
+                    Match status = Regex.Match(notification, @"<status>\s*(completed|failed|killed|cancelled|stopped)\s*</status>", RegexOptions.IgnoreCase);
+                    if (id.Success && status.Success && f.BackgroundFinished(id.Groups[1].Value.Trim())) f.Resume(t);
+                    return;
+                }
+            }
             if (type == "assistant")
             {
                 Dictionary<string, object> m = J.D(d, "message");
@@ -1770,7 +1930,7 @@ namespace ZedColors
                     if (stopReason == "end_turn" || stopReason == "stop_sequence")
                     {
                         // Claude pauses here while background work it started is still running.
-                        if (f.Background > 0) { f.Resume(t); f.Did("", null, "Waiting for background work"); f.PausedAt = t; }
+                        if (f.Background > 0) { f.Resume(t); f.Did("", null, "Waiting for background work"); f.WaitingForBackground = true; }
                         else f.EndTurn(t);
                     }
                     else if (stopReason == "tool_use" && !f.Working) f.StartTurn(t);
@@ -1779,7 +1939,7 @@ namespace ZedColors
                         foreach (object o in items)
                         {
                             Dictionary<string, object> it = o as Dictionary<string, object>;
-                            if (it != null && J.S(it, "type") == "tool_use") ClaudeStep(f, J.S(it, "name"), J.D(it, "input"), t);
+                            if (it != null && J.S(it, "type") == "tool_use") ClaudeStep(f, J.S(it, "id"), J.S(it, "name"), J.D(it, "input"), t);
                         }
                 }
                 Dictionary<string, object> u = J.D(m, "usage");
@@ -1798,14 +1958,7 @@ namespace ZedColors
             }
             else if (type == "user" && f.WantText)
             {
-                if (intr) { f.Background = 0; f.EndTurn(t); return; } // you pressed stop
-                if (Has(s, "<task-notification"))
-                {
-                    // A background task reported back; Claude picks up again.
-                    f.Background = Math.Max(0, f.Background - 1);
-                    f.Resume(t);
-                    return;
-                }
+                if (intr) { f.BackgroundTasks.Clear(); f.EndTurn(t); return; } // you pressed stop
                 string p = Transcripts.FromLine(d, MaxText);
                 if (p == null) return;
                 if (!J.B(d, "isSidechain")) f.StartTurn(t);
@@ -1857,13 +2010,17 @@ namespace ZedColors
             return tool.Replace('_', ' ');
         }
 
-        static void ClaudeStep(FileScan f, string name, Dictionary<string, object> input, DateTime t)
+        static void ClaudeStep(FileScan f, string tool, string name, Dictionary<string, object> input, DateTime t)
         {
             if (name == null) return;
             if (input == null) input = new Dictionary<string, object>();
             // Background work Claude will wait for (it reports back later as a task notification).
-            if (J.B(input, "run_in_background") || name == "Monitor") f.Background++;
-            else if (name == "TaskStop") f.Background = Math.Max(0, f.Background - 1);
+            if (J.B(input, "run_in_background") || name == "Monitor") f.BackgroundStarted(tool);
+            else if (name == "TaskStop" && tool != null)
+            {
+                string task = J.S(input, "task_id");
+                if (task != null) f.BackgroundStops[tool] = task;
+            }
             string fn = FileName(J.S(input, "file_path") ?? J.S(input, "notebook_path"));
             string desc = J.S(input, "description");
             switch (name)
@@ -1873,7 +2030,7 @@ namespace ZedColors
                 case "Bash": case "PowerShell": f.Did("command", null, desc ?? "Running a command"); break;
                 case "Grep": case "Glob": case "ToolSearch": f.Did("search", null, "Searching the files"); break;
                 case "WebSearch": case "WebFetch": f.Did("search", null, "Looking things up online"); break;
-                case "Agent": case "Task": f.Did("helper", null, "Running a helper agent" + (desc != null ? ": " + desc : "")); break;
+                case "Agent": case "Task": f.HelperStarted(tool); f.Did("helper", null, "Calling a helper agent" + (desc != null ? ": " + desc : "")); break;
                 case "AskUserQuestion": f.Did("", null, "Waiting for your answer"); f.Ask(FormatQuestions(J.A(input, "questions"), "question", "options"), t, true); break;
                 case "TodoWrite": case "TaskStop": case "Monitor": break;
                 default: f.Did("", null, "Using " + Friendly(name)); break;
@@ -1905,7 +2062,18 @@ namespace ZedColors
                 case "read_powershell": case "write_powershell": case "stop_powershell": break; // follow-ups to a command already counted
                 case "rg": case "grep": case "glob": case "file_search": f.Did("search", null, "Searching the files"); break;
                 case "web_fetch": case "web_search": f.Did("search", null, "Looking things up online"); break;
-                case "task": f.Did("helper", null, "Running a helper agent" + (a != null && J.S(a, "description") != null ? ": " + J.S(a, "description") : "")); break;
+                case "task":
+                    if (J.S(data, "parentToolCallId") == null)
+                    {
+                        string id = J.S(data, "toolCallId");
+                        f.HelperStarted(id);
+                        if (id != null && a != null && J.S(a, "mode") == "background")
+                        {
+                            f.BackgroundStarted(id);
+                        }
+                    }
+                    f.Did("helper", null, "Calling a helper agent" + (a != null && J.S(a, "description") != null ? ": " + J.S(a, "description") : ""));
+                    break;
                 case "ask_user": f.Did("", null, "Waiting for your answer"); if (a != null) f.Ask(FormatQuestions(new object[] { a }, "question", "choices"), t, true); break;
                 default: f.Did("", null, title ?? ("Using " + Friendly(tool))); break;
             }
@@ -2023,7 +2191,8 @@ namespace ZedColors
             bool um = Has(s, "\"user.message\"");
             bool am = f.WantText && Has(s, "\"assistant.message\"");
             bool pr = Has(s, "totalPremiumRequests");
-            bool turn = f.WantText && (Has(s, "\"assistant.turn_") || Has(s, "\"tool.execution_start\"")
+            bool turn = f.WantText && (Has(s, "\"assistant.turn_") || Has(s, "\"tool.execution_start\"") || Has(s, "\"tool.execution_complete\"")
+                        || Has(s, "\"subagent.completed\"")
                         || Has(s, "\"session.shutdown\"") || Has(s, "\"session.error\"") || Has(s, "abort"));
             if (!um && !am && !pr && !turn) return;
             Dictionary<string, object> d = Parse(s);
@@ -2060,7 +2229,20 @@ namespace ZedColors
                     if (!f.Working) f.StartTurn(t);
                     if (data != null) CopilotStep(f, data, t);
                 }
-                else if (type == "assistant.turn_end") { if (f.LastTools == 0) f.EndTurn(t); }
+                else if (type == "tool.execution_complete" && data != null) CopilotHelperResult(f, data);
+                else if (type == "subagent.completed" && data != null)
+                {
+                    f.BackgroundFinished(J.S(data, "toolCallId"));
+                    if (f.Background == 0) f.WaitingForBackground = false;
+                }
+                else if (type == "assistant.turn_end")
+                {
+                    if (f.LastTools == 0)
+                    {
+                        if (f.Background > 0) { f.Resume(t); f.WaitingForBackground = true; }
+                        else f.EndTurn(t);
+                    }
+                }
                 else if (type == "session.shutdown" || type == "session.error" || type.Contains("abort")) { if (f.Working) f.EndTurn(t); }
             }
             if (data != null && data.ContainsKey("totalPremiumRequests"))
@@ -2073,6 +2255,18 @@ namespace ZedColors
                     f.PremiumMax = v;
                 }
             }
+        }
+
+        static void CopilotHelperResult(FileScan f, Dictionary<string, object> data)
+        {
+            string tool = J.S(data, "toolCallId");
+            if (tool == null) return;
+            if (f.BackgroundTools.ContainsKey(tool))
+            {
+                if (!J.B(data, "success")) f.BackgroundFinished(tool);
+                return;
+            }
+            f.HelperFinished(tool);
         }
 
         static void Inc(Dictionary<DateTime, int> d, DateTime k, int n)
@@ -2142,14 +2336,8 @@ namespace ZedColors
                 if (d.File == null || !scans.TryGetValue(d.File, out f)) continue;
                 ThreadUsage tu = new ThreadUsage();
                 tu.HasTurn = f.HasTurn; tu.Working = f.Working; tu.TurnStart = f.TurnStart; tu.TurnEnd = f.TurnEnd;
-                // Waiting only on background work, and nothing has happened for 10 minutes: a task never
-                // reported back (e.g. it was cut off), so count the thread as finished from when it paused.
-                if (f.Working && f.PausedAt != DateTime.MinValue && f.Write != DateTime.MinValue
-                    && (DateTime.Now - f.Write.ToLocalTime()).TotalMinutes >= 10)
-                {
-                    tu.Working = false;
-                    tu.TurnEnd = f.PausedAt;
-                }
+                tu.ActiveHelpers = f.ActiveHelpers;
+                tu.WaitingForHelpers = f.WaitingForBackground && f.ActiveHelpers > 0;
                 tu.Summary = f.Summary(); tu.Step = f.Step;
                 tu.AskText = f.AskText; tu.AskTime = f.AskTime;
                 tu.LastWrite = f.Write == DateTime.MinValue ? DateTime.MinValue : f.Write.ToLocalTime();
@@ -3480,7 +3668,7 @@ namespace ZedColors
             Color c;
             string st = App.StatusTextPublic(tu, out c);
             string sum = tu != null && !string.IsNullOrEmpty(tu.Summary) ? (tu.Working ? "This turn: " : "Last turn: ") + tu.Summary : "";
-            status.Text = (st ?? "") + (st != null && tu != null && tu.Working && !string.IsNullOrEmpty(tu.Step) ? "  ?  " + tu.Step : "") + (sum.Length > 0 ? "\n" + sum : "");
+            status.Text = (st ?? "") + (st != null && tu != null && tu.Working && !tu.WaitingForHelpers && !string.IsNullOrEmpty(tu.Step) ? "  ?  " + tu.Step : "") + (sum.Length > 0 ? "\n" + sum : "");
             status.ForeColor = c;
             asks.Text = tu != null && !string.IsNullOrEmpty(tu.AskText) ? "Asking you:\n" + tu.AskText : "";
             promptLbl.Text = lastYou != null ? "Your last prompt: " + Flat(lastYou.Text, 260) : "";
@@ -4577,20 +4765,30 @@ namespace ZedColors
         }
 
         const double StaleMinutes = 30; // "working" with no file activity this long = probably stopped
+        const double CompletionFlashSeconds = 5;
 
         // "Working 3m 12s" / "Done 2m ago" for a thread, or null when unknown.
         static string StatusText(ThreadUsage tu, out Color c)
         {
             c = Theme.Dim;
             if (tu == null || !tu.HasTurn) return null;
-            if (!string.IsNullOrEmpty(tu.AskText)) { c = Theme.Accent; return "Waiting for your answer"; }
+            if (!string.IsNullOrEmpty(tu.AskText))
+            {
+                c = Theme.Accent;
+                return "Waiting for your answer" + (tu.ActiveHelpers > 0 ? " \u00B7 " + tu.ActiveHelpers
+                    + (tu.ActiveHelpers == 1 ? " helper agent working" : " helper agents working") : "");
+            }
             DateTime now = DateTime.Now;
             if (tu.Working)
             {
                 TimeSpan quiet = tu.LastWrite == DateTime.MinValue ? TimeSpan.Zero : now - tu.LastWrite;
                 if (quiet.TotalMinutes >= StaleMinutes) return "No activity for " + Theme.Ago(quiet);
                 c = Theme.Working;
-                string s = tu.TurnStart == DateTime.MinValue ? "Working" : "Working " + Theme.Dur(now - tu.TurnStart);
+                string s = "Working";
+                if (tu.ActiveHelpers > 0)
+                    s = (tu.WaitingForHelpers ? "Waiting for " : "Working with ") + tu.ActiveHelpers
+                        + (tu.ActiveHelpers == 1 ? " helper agent" : " helper agents");
+                if (tu.TurnStart != DateTime.MinValue) s += " " + Theme.Dur(now - tu.TurnStart);
                 if (quiet.TotalMinutes >= 2) s += " (quiet " + Theme.Ago(quiet) + ")";
                 return s;
             }
@@ -4613,7 +4811,7 @@ namespace ZedColors
             string s = active == null ? null : StatusText(tu, out c);
             if (s == null) { s = ""; c = Theme.Dim; }
             // While working, add the current step: "Working 3m 12s - Editing App.jsx"
-            if (tu != null && tu.Working && c == Theme.Working && !string.IsNullOrEmpty(tu.Step))
+            if (tu != null && tu.Working && !tu.WaitingForHelpers && c == Theme.Working && !string.IsNullOrEmpty(tu.Step))
             {
                 string step = tu.Step.Length > 40 ? tu.Step.Substring(0, 39) + "..." : tu.Step;
                 s += "  \u00B7  " + step;
@@ -4709,6 +4907,7 @@ namespace ZedColors
         void UpdateDots()
         {
             Dictionary<string, int> d = new Dictionary<string, int>();
+            Dictionary<string, int> helpers = new Dictionary<string, int>();
             DateTime now = DateTime.Now;
             foreach (Row r in form.Rows)
             {
@@ -4720,11 +4919,18 @@ namespace ZedColors
                 bool stale = tu.LastWrite != DateTime.MinValue && (now - tu.LastWrite).TotalMinutes >= StaleMinutes;
                 if (!string.IsNullOrEmpty(tu.AskText)) d[r.Key] = 3; // asked you a question
                 else if (tu.Working && !stale) d[r.Key] = 1;
-                else if (!tu.Working && tu.TurnEnd > SeenAt(t.Session)) d[r.Key] = 2;
+                else if (!tu.Working && tu.TurnEnd != DateTime.MinValue)
+                {
+                    double ago = (now - tu.TurnEnd).TotalSeconds;
+                    if (tu.TurnEnd > SeenAt(t.Session) || (ago >= 0 && ago < CompletionFlashSeconds)) d[r.Key] = 2;
+                }
+                if (tu.Working && !stale && tu.ActiveHelpers > 0 && d.ContainsKey(r.Key)) helpers[r.Key] = tu.ActiveHelpers;
             }
             bool same = d.Count == rings.Dots.Count;
             if (same) foreach (KeyValuePair<string, int> kv in d) { int v; if (!rings.Dots.TryGetValue(kv.Key, out v) || v != kv.Value) { same = false; break; } }
-            if (!same) { rings.Dots = d; rings.Invalidate(); }
+            if (same) same = helpers.Count == rings.ActiveHelpers.Count;
+            if (same) foreach (KeyValuePair<string, int> kv in helpers) { int v; if (!rings.ActiveHelpers.TryGetValue(kv.Key, out v) || v != kv.Value) { same = false; break; } }
+            if (!same) { rings.Dots = d; rings.ActiveHelpers = helpers; rings.Invalidate(); }
         }
 
         // The thread row in Zed's sidebar under this screen point, or null.
@@ -4791,7 +4997,7 @@ namespace ZedColors
             ThreadUsage tu = UsageFor(t.Session);
             Color sc;
             string st = StatusText(tu, out sc);
-            if (st != null) l.Add(new ULine(st + (tu.Working && !string.IsNullOrEmpty(tu.Step) && sc == Theme.Working ? " \u00B7 " + tu.Step : ""), sc, false));
+            if (st != null) l.Add(new ULine(st + (tu.Working && !tu.WaitingForHelpers && !string.IsNullOrEmpty(tu.Step) && sc == Theme.Working ? " \u00B7 " + tu.Step : ""), sc, false));
             if (tu != null && !string.IsNullOrEmpty(tu.Summary)) l.Add(new ULine((tu.Working ? "This turn: " : "Last turn: ") + tu.Summary, Theme.Dim, false));
             if (tu != null && tu.LastWrite != DateTime.MinValue)
                 l.Add(new ULine("Last activity: " + Theme.Ago(DateTime.Now - tu.LastWrite) + " ago", Theme.Dim, false));
