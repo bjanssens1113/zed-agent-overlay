@@ -3,7 +3,6 @@
 #   Left-click a bar  : pick a color (9 Ayu Mirage colors, or None)
 #   Right-click a bar : clear color
 #   Each thread's "box" is a tall color bar beside its row in the sidebar.
-#   A bar's color also clears by itself when its agent starts working again.
 #   Ring around the thread's row: blue (pulsing) = agent working, green = finished since you
 #   last opened the thread. Clicks pass straight through the ring to Zed.
 #   Rest the mouse on a thread in the sidebar for a card with its status, your last prompt, and usage.
@@ -1108,7 +1107,7 @@ namespace ZedColors
         public static readonly Color Dim = Color.FromArgb(0x9a, 0x9a, 0x98);     // text.muted
         public static readonly Color Accent = Color.FromArgb(0xfe, 0xcf, 0x72);  // warning (Ayu amber)
         public static readonly Color Working = Color.FromArgb(0x72, 0xcf, 0xfe); // info / text.accent (Zed blue)
-        public static readonly Color Done = Color.FromArgb(0xd5, 0xfe, 0x80);    // success (Ayu lime)
+        public static readonly Color Done = Color.FromArgb(0x87, 0xd9, 0x6c);    // Ayu's "added" green (its lime reads as amber)
         public static readonly Color Error = Color.FromArgb(0xf1, 0x87, 0x79);   // error (Ayu coral)
 
         // Zed's own UI font is bundled inside Zed, so use the closest Windows font.
@@ -1277,10 +1276,25 @@ namespace ZedColors
             return char.ToUpper(s[0]) + s.Substring(1);
         }
 
+        // Claude: background commands, monitors and helper agents still running. Claude ends its turn
+        // while they run and picks up again when each one reports back, so it isn't done yet.
+        public int Background;
+        public DateTime PausedAt = DateTime.MinValue; // when Claude ended its turn to wait on background work
+
+        // The agent picked up again without a new prompt from you (e.g. a background task reported back).
+        public void Resume(DateTime t)
+        {
+            PausedAt = DateTime.MinValue;
+            if (Working) return;
+            Working = true; HasTurn = true;
+            if (TurnStart == DateTime.MinValue) TurnStart = t;
+        }
+
         public void EndTurn(DateTime t)
         {
             if (t == DateTime.MinValue) return;
             if (askClearsOnStep) AskText = null;
+            PausedAt = DateTime.MinValue;
             HasTurn = true; Working = false; TurnEnd = t;
         }
 
@@ -1293,7 +1307,7 @@ namespace ZedColors
             IdTok = new Dictionary<string, long>(); IdDay = new Dictionary<string, DateTime>();
             CodexTotal = -1; Primary = null; Secondary = null; Plan = null; RateTime = DateTime.MinValue;
             PremiumMax = 0; Prompts = 0;
-            AskText = null; AskTime = DateTime.MinValue;
+            AskText = null; AskTime = DateTime.MinValue; Background = 0; PausedAt = DateTime.MinValue;
             PremDay = new Dictionary<DateTime, int>(); PromptDay = new Dictionary<DateTime, int>();
         }
     }
@@ -1663,7 +1677,12 @@ namespace ZedColors
                 {
                     // end_turn = finished; tool_use = still working on it
                     string stopReason = J.S(m, "stop_reason");
-                    if (stopReason == "end_turn" || stopReason == "stop_sequence") f.EndTurn(t);
+                    if (stopReason == "end_turn" || stopReason == "stop_sequence")
+                    {
+                        // Claude pauses here while background work it started is still running.
+                        if (f.Background > 0) { f.Resume(t); f.Did("", null, "Waiting for background work"); f.PausedAt = t; }
+                        else f.EndTurn(t);
+                    }
                     else if (stopReason == "tool_use" && !f.Working) f.StartTurn(t);
                     object[] items = J.A(m, "content");
                     if (items != null && f.WantText)
@@ -1689,7 +1708,14 @@ namespace ZedColors
             }
             else if (type == "user" && f.WantText)
             {
-                if (intr) { f.EndTurn(t); return; } // you pressed stop
+                if (intr) { f.Background = 0; f.EndTurn(t); return; } // you pressed stop
+                if (Has(s, "<task-notification"))
+                {
+                    // A background task reported back; Claude picks up again.
+                    f.Background = Math.Max(0, f.Background - 1);
+                    f.Resume(t);
+                    return;
+                }
                 string p = Transcripts.FromLine(d, MaxText);
                 if (p == null) return;
                 if (!J.B(d, "isSidechain")) f.StartTurn(t);
@@ -1745,6 +1771,9 @@ namespace ZedColors
         {
             if (name == null) return;
             if (input == null) input = new Dictionary<string, object>();
+            // Background work Claude will wait for (it reports back later as a task notification).
+            if (J.B(input, "run_in_background") || name == "Monitor") f.Background++;
+            else if (name == "TaskStop") f.Background = Math.Max(0, f.Background - 1);
             string fn = FileName(J.S(input, "file_path") ?? J.S(input, "notebook_path"));
             string desc = J.S(input, "description");
             switch (name)
@@ -1839,9 +1868,9 @@ namespace ZedColors
             }
             if (type == "response_item" && pt == "function_call" && J.S(p, "name") == "request_user_input_async")
             {
-                if (f.Working) f.Did("", null, "Waiting for your answer");
-                Dictionary<string, object> args = J.D(p, "arguments") ?? Parse(J.S(p, "arguments") ?? "");
-                if (args != null) f.Ask(FormatQuestions(J.A(args, "questions"), "title", "options"), t, false);
+                // Codex's question tool doesn't wait: it answers itself ("accepted") and keeps working,
+                // so it isn't "waiting on you". Anything Codex really needs shows up in its final reply,
+                // which the Needs-you window reads.
                 return;
             }
 
@@ -2023,6 +2052,14 @@ namespace ZedColors
                 if (d.File == null || !scans.TryGetValue(d.File, out f)) continue;
                 ThreadUsage tu = new ThreadUsage();
                 tu.HasTurn = f.HasTurn; tu.Working = f.Working; tu.TurnStart = f.TurnStart; tu.TurnEnd = f.TurnEnd;
+                // Waiting only on background work, and nothing has happened for 10 minutes: a task never
+                // reported back (e.g. it was cut off), so count the thread as finished from when it paused.
+                if (f.Working && f.PausedAt != DateTime.MinValue && f.Write != DateTime.MinValue
+                    && (DateTime.Now - f.Write.ToLocalTime()).TotalMinutes >= 10)
+                {
+                    tu.Working = false;
+                    tu.TurnEnd = f.PausedAt;
+                }
                 tu.Summary = f.Summary(); tu.Step = f.Step;
                 tu.AskText = f.AskText; tu.AskTime = f.AskTime;
                 tu.LastWrite = f.Write == DateTime.MinValue ? DateTime.MinValue : f.Write.ToLocalTime();
@@ -3404,7 +3441,7 @@ namespace ZedColors
         public static Color[] Palette = new Color[] {
             Color.Empty,
             Theme.Error,                          // 1 red    - Ayu coral
-            Theme.Done,                           // 2 green  - Ayu lime
+            Theme.Done,                           // 2 green  - Ayu "added" green
             Theme.Accent,                         // 3 yellow - Ayu amber
             Color.FromArgb(0x72, 0xcf, 0xfe),     // 4 blue
             Color.FromArgb(0x5b, 0xcd, 0xe5),     // 5 cyan
@@ -4582,19 +4619,6 @@ namespace ZedColors
             t.Start();
         }
 
-        Dictionary<string, DateTime> turnSeen = new Dictionary<string, DateTime>(); // session -> start of the newest turn seen
-
-        void ClearColor(string key)
-        {
-            string k = Resolve(key);
-            if (k == null || !colors.ContainsKey(k)) return;
-            colors.Remove(k);
-            aliases.Clear();
-            Save();
-            form.Invalidate();
-            Log("cleared color on " + key + " (agent started working again)");
-        }
-
         void UpdateDots()
         {
             Dictionary<string, int> d = new Dictionary<string, int>();
@@ -4605,12 +4629,6 @@ namespace ZedColors
                 if (t == null) continue;
                 ThreadUsage tu = UsageFor(t.Session);
                 if (tu == null || !tu.HasTurn) continue;
-
-                // The agent started a new piece of work: your color for this thread resets.
-                DateTime prevStart;
-                bool known = turnSeen.TryGetValue(t.Session, out prevStart);
-                if (known && tu.Working && tu.TurnStart > prevStart) ClearColor(r.Key);
-                turnSeen[t.Session] = tu.TurnStart;
 
                 bool stale = tu.LastWrite != DateTime.MinValue && (now - tu.LastWrite).TotalMinutes >= StaleMinutes;
                 if (!string.IsNullOrEmpty(tu.AskText)) d[r.Key] = 3; // asked you a question

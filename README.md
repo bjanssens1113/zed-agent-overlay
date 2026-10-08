@@ -9,7 +9,7 @@ It sits on top of Zed's window, follows it around, and never changes anything in
 ## What it adds
 
 **In the threads sidebar**
-- **Color bar beside every thread.** Click it to tag the thread with one of 9 colors (from Zed's Ayu Mirage theme), right-click to clear. A thread's color clears by itself when its agent starts working again.
+- **Color bar beside every thread.** Click it to tag the thread with one of 9 colors (from Zed's Ayu Mirage theme), right-click to clear. Colors only change when you change them.
 - **Status ring around each thread.** Blue (gently pulsing) while the agent works, amber (pulsing) while it waits on your answer, green when it finished since you last opened the thread.
 - **Hover card.** Rest the mouse on a thread to see its status, what it did this turn, your last prompt and its token use, without opening it.
 
