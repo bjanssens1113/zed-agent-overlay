@@ -8,7 +8,7 @@ It sits on top of Zed's window, follows it around, and never changes anything in
 
 It works across projects and applications in Zed. Status and helper tracking use each thread's agent session, not its project or application name. Agent-format limitations apply equally to every project.
 
-![Illustrative preview of thread colors, status rings, the last-prompt bar, and Needs you](docs/overlay-preview.svg)
+![Illustrative preview of thread colors, status rings, sidebar hover details, and Needs you](docs/overlay-preview.svg)
 
 *Illustrative preview with made-up threads and usage numbers, not a screenshot.*
 
@@ -17,17 +17,10 @@ It works across projects and applications in Zed. Status and helper tracking use
 **In the threads sidebar**
 - **Color bar beside every thread.** Click it to tag the thread with one of 9 colors (from Zed's Ayu Mirage theme), right-click to clear. Colors only change when you change them.
 - **Status ring around each thread.** Blue (gently pulsing) while the agent works, amber (pulsing) while it waits on your answer, green when it finishes. Green stays until you view the thread; if you're already viewing it, green appears briefly for five seconds.
-- **Helper-agent dashes beneath the ring.** One blue dash per active helper, capped at six dashes with a **+** for more. The hover card and open-thread status show the exact count, distinguishing "Working with 3 helper agents" from "Waiting for 3 helper agents." Background commands and finished helpers are not counted.
-- **Hover card.** Rest the mouse on a thread to see its status, what it did this turn, your last prompt and its token use, without opening it.
-
-**Over the open thread**
-- **Last-prompt bar.** Your most recent prompt, expanded by default when the overlay starts or you switch threads. Click to collapse or expand, right-click to copy. A manual collapse lasts for the current thread, without changing the default.
-- **Previous / next / bottom buttons** that step through your prompts in the thread. The bar shows which prompt you are on ("11 of 12").
-- **What the agent is doing, in plain words.** "Working 3m 12s · Editing App.jsx", and a turn summary like "Read 4 files · ran 3 commands · edited 2 files (a.ps1, b.md)". Claude and Copilot describe each command in one line; that line is shown instead of the command.
-- **Usage chip.** Codex's weekly limit % and reset time, Claude's token counts, Copilot's premium requests. Click it for a summary of all three.
-- **GitHub card.** The newest GitHub Actions run for the repo(s) in the thread's folders: a progress bar while it runs, then passed or failed. Click to open the run.
-- **Movable, resizable panels.** Drag a panel's dotted handle to move it; drag an edge or corner to resize it. Making the prompt bar taller expands its wrapped text. Positions and sizes are remembered relative to Zed, follow its window, and stay within its visible main content area. The GitHub card follows the prompt bar until you adjust it independently.
-- **Agent dashboard.** A separate movable, resizable panel shows the current thread's recorded activity, active helper descriptions where available (otherwise counts), and questions needing your attention in other threads. Empty helper/attention sections disappear. Click an attention entry to Peek; scroll with the mouse wheel or the panel's arrow buttons. All information comes from local background-loaded snapshots, not inferred test results or milestones.
+- **Helper-agent dashes beneath the ring.** One blue dash per active helper, capped at six dashes with a **+** for more. The hover card shows the exact count, distinguishing "Working with 3 helper agents" from "Waiting for 3 helper agents." Background commands and finished helpers are not counted.
+- **Hover card.** Rest the mouse on a thread to see its status, what it did this turn, your last prompt and its usage, without opening it. Codex also shows recorded limit percentages and reset times. Claude and Copilot describe each command in one line; that description is shown instead of the command.
+- **GitHub status in the hover card.** The newest GitHub Actions run for the repo(s) in the hovered thread's folders: repository, workflow, branch, running percentage and completed steps, or passed/failed/cancelled status. Move onto the hover card and click **Open GitHub run** to view it. Results are kept separate for each thread's project folders, including when hovering a different project from the open thread. Loading, missing repositories, no runs, and failed checks are identified explicitly.
+- **No floating Last Prompt or GitHub panels.** Thread details appear on hover, leaving the conversation area clear. Use Zed's own prompt-navigation shortcuts (`Ctrl+Alt+Shift+PageUp/PageDown`, `Ctrl+Alt+End`) and tray > **Usage summary** for more detail.
 
 **Windows you can open**
 - **Search threads** (magnifier button, tray menu, or `Ctrl+Alt+Shift+F`): search your prompts and the agents' replies across every thread, including archived ones.
@@ -41,7 +34,7 @@ It works across projects and applications in Zed. Status and helper tracking use
 - Zed with the Threads Sidebar on the **left**.
 - One or more of: Claude Code (`claude-acp`), Codex (`codex-acp`), GitHub Copilot CLI (`github-copilot-cli`) in Zed's Agent Panel.
 - Windows' built-in text recognition, which comes with your Windows display language (English works).
-- Optional: the [GitHub CLI](https://cli.github.com/) (`gh`), signed in, for the GitHub card.
+- Optional: the [GitHub CLI](https://cli.github.com/) (`gh`), signed in, for GitHub hover status.
 
 ## Install
 
@@ -51,18 +44,17 @@ It works across projects and applications in Zed. Status and helper tracking use
 
 **Start with Windows is off by default.** Enable it from the tray menu if you want the overlay to start when you sign in. Updating an existing installation keeps your current startup setting. To update: tray icon > **Quit**, replace the files, start it again.
 
-Use tray > **Lock overlay layout** to prevent accidental moves and resizes without disabling the panels' normal buttons. **Reset overlay layout** restores their original positions and sizes. Layout and lock preferences are saved locally and scale with your display's DPI; temporary window-size constraints do not overwrite your chosen layout.
+Copilot's injected agent messages, nested helper messages, and runtime notifications are excluded from your last prompt and prompt counts. Old floating-panel layouts in `layout.json` are left untouched and are no longer loaded or saved.
 
-The dashboard has its own saved position and size and a tray > **Show agent dashboard** toggle. Lock/reset applies to all three panels. Copilot's injected agent messages, nested helper messages, and runtime notifications are excluded from Last Prompt, prompt navigation, and prompt counts.
+There is no Questions inbox or question-tracking protocol. Local global instructions require Claude, Codex, and Copilot to ask every question through an explicit native prompt, including open-ended questions, rather than burying it in chat text. If a prompt tool is unavailable, agents must report that limitation. Restart conversations to load updated instructions. Existing `questions.json` archives are left untouched but are no longer read or written by the overlay.
 
 ## How it works
 
 - **Finding threads on screen.** Zed doesn't tell Windows where its sidebar rows are, so the overlay reads the sidebar with Windows' built-in text recognition (OCR) and lines up with the thread names. Recognition runs on a separate, low-priority worker, with one capture at a time so animated icons cannot prevent results from appearing. Results are discarded if Zed moves, resizes, minimizes, or loses focus while recognition runs. It matches names to a background-loaded copy of Zed's local thread database (read-only).
 - **Reading the agents.** Each agent keeps its conversation in local files (`~/.claude/projects`, `~/.codex/sessions`, `~/.copilot/session-state`). Search and usage read only the new part each time. The last-prompt reader checks a bounded portion of changed files. All history reading runs on a low-priority background thread, not on the interface thread.
 - **Claude background work.** Background jobs are tracked by task ID, including completions delivered as queued messages and helpers restarted through `SendMessage`. Duplicate notifications do not double-count a job or turn a finished thread blue again. A quiet background job is not assumed finished: after 30 minutes without recorded activity, the status says "No activity" and the working ring clears rather than turning green.
-- **Nothing leaves your PC**, except the GitHub card's calls to GitHub through your own signed-in `gh` tool.
-- The prompt jump buttons press Zed's own default keys (`Ctrl+Alt+Shift+PageUp/PageDown`, `Ctrl+Alt+End`).
-- It keeps its own files in `%LOCALAPPDATA%\ZedThreadColors` (your colors, which threads you've seen, panel layout in `layout.json`, and a log).
+- **Nothing leaves your PC**, except the GitHub status checks through your own signed-in `gh` tool.
+- It keeps its own files in `%LOCALAPPDATA%\ZedThreadColors` (your colors, which threads you've seen, and a log).
 
 ## Limits
 
@@ -72,7 +64,7 @@ The dashboard has its own saved position and size and a tray > **Show agent dash
 - **"Needs you" uses word patterns** to find asks in a reply. It can miss one or include a sentence that isn't one.
 - **No plan limits for Claude or Copilot.** Their files don't record them, so only Codex shows a percentage.
 - **Helper counts depend on the agent.** Claude tracks foreground, background, and restarted helpers. Copilot tracks directly called foreground and background helpers; a background helper stays counted after its launch call returns, until its recorded `subagent.completed` event. Codex helper counts aren't tracked yet.
-- **It follows these agents' file formats as of October 2026.** Missing or unreadable histories are identified in the prompt bar and search status, with details in the log (tray > **Open log**). The open thread's history is retried on every background pass (about 1.5 seconds), so a newly created session can acquire its working ring as soon as its history appears. Other missing histories are checked again after 30 seconds. A changed format can still leave usage at `--` or produce no recognized messages; that does not mean the agent has no activity.
+- **It follows these agents' file formats as of October 2026.** Missing or unreadable histories are identified in hover details and search status, with details in the log (tray > **Open log**). The open thread's history is retried on every background pass (about 1.5 seconds), so a newly created session can acquire its working ring as soon as its history appears. Other missing histories are checked again after 30 seconds. A changed format can still produce no recognized usage or messages; that does not mean the agent has no activity.
 
 ## Built with
 
