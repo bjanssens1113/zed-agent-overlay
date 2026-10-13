@@ -3920,16 +3920,27 @@ namespace ZedColors
 
         List<Row> ReadRows()
         {
-            // Group words into lines.
-            SortedDictionary<int, List<Word>> byLine = new SortedDictionary<int, List<Word>>();
-            foreach (Word w in words)
+            // Animated icons can split one visual line into several OCR line IDs, or join a
+            // title and timestamp into one ID. Use the words' vertical bounds instead.
+            List<Word> ordered = new List<Word>(words);
+            ordered.Sort(delegate (Word a, Word b) { return (a.Y + a.H / 2).CompareTo(b.Y + b.H / 2); });
+            List<List<Word>> byLine = new List<List<Word>>();
+            double lineTop = 0, lineBottom = 0;
+            foreach (Word w in ordered)
             {
-                if (!byLine.ContainsKey(w.Line)) byLine[w.Line] = new List<Word>();
-                byLine[w.Line].Add(w);
+                if (w.H <= 0 || string.IsNullOrWhiteSpace(w.Text)) continue;
+                double overlap = Math.Min(lineBottom, w.Y + w.H) - Math.Max(lineTop, w.Y);
+                if (byLine.Count == 0 || overlap < Math.Min(lineBottom - lineTop, w.H) * 0.5)
+                {
+                    byLine.Add(new List<Word>());
+                    lineTop = w.Y; lineBottom = w.Y + w.H;
+                }
+                byLine[byLine.Count - 1].Add(w);
+                lineTop = Math.Max(lineTop, w.Y); lineBottom = Math.Min(lineBottom, w.Y + w.H);
             }
 
             List<OLine> lines = new List<OLine>();
-            foreach (List<Word> ws in byLine.Values)
+            foreach (List<Word> ws in byLine)
             {
                 ws.Sort(delegate (Word a, Word b) { return a.X.CompareTo(b.X); });
                 // Drop a leading icon glyph that OCR read as a stray character (e.g. the agent logo).
@@ -3957,6 +3968,7 @@ namespace ZedColors
                 if (lt.Contains("search thread")) continue;
                 if (lt.Contains("no threads yet")) continue;
                 l.IsSub = IsSubtitle(l.Text);
+                if (!l.IsSub && (l.Text.Length == 1 || (l.Text.Length <= 2 && !IsWordy(l.Text)))) continue;
                 content.Add(l);
             }
 

@@ -179,6 +179,69 @@ try {
     $allMissingRows = @(Invoke-Private $parserApp 'ReadRows')
     Assert ($allMissingRows[1].RowBottom -eq $completeRows[1].RowBottom) 'Previously measured timestamp spacing must survive a capture where every timestamp is missed.'
     $parserApp.BeginOcr()
+    Add-SidebarLine 0 'same-project' 16 70
+    $parserApp.AddWord(1, 'Build', 80, 200, 60, 28)
+    $parserApp.AddWord(2, 'API', 150, 202, 40, 26)
+    $parserApp.AddWord(3, '1', 200, 200, 14, 28)
+    Add-SidebarLine 4 '1m' 40 124
+    Add-SidebarLine 5 'Build API 2' 40 160
+    Add-SidebarLine 6 '2m' 40 184
+    $splitRows = @(Invoke-Private $parserApp 'ReadRows')
+    Assert ($splitRows.Count -eq 2 -and $splitRows[0].Title -eq 'Build API 1') 'OCR fragments on the same visual title line must form one session rather than multiple boxes.'
+    Assert ($splitRows[0].RowTop -eq $completeRows[0].RowTop -and $splitRows[0].RowBottom -eq $completeRows[0].RowBottom) 'Splitting a title across OCR line IDs must not collapse the ring through the text.'
+    $parserApp.BeginOcr()
+    Add-SidebarLine 0 'same-project' 16 70
+    Add-SidebarLine 1 'Build API 1' 40 100
+    Add-SidebarLine 1 '1m' 40 124
+    Add-SidebarLine 2 'Build API 2' 40 160
+    Add-SidebarLine 2 '2m' 40 184
+    $mergedRows = @(Invoke-Private $parserApp 'ReadRows')
+    Assert ($mergedRows.Count -eq 2 -and $mergedRows[0].Key -eq $completeRows[0].Key) 'Title and timestamp sharing an OCR line ID must remain distinct visual lines and preserve the color key.'
+    Assert ($mergedRows[0].RowBottom -eq $completeRows[0].RowBottom) 'Merged OCR line IDs must not distort session height.'
+    $parserApp.BeginOcr()
+    Add-SidebarLine 0 'same-project' 16 70
+    Add-SidebarLine 1 'Build API 1' 40 100
+    $parserApp.AddWord(2, 'O', 32, 224, 12, 12)
+    Add-SidebarLine 3 '1m' 40 124
+    Add-SidebarLine 4 'Build API 2' 40 160
+    Add-SidebarLine 5 '2m' 40 184
+    $iconRows = @(Invoke-Private $parserApp 'ReadRows')
+    Assert ($iconRows.Count -eq 2 -and $iconRows[0].RowBottom -eq $completeRows[0].RowBottom) 'An isolated animated icon between title and timestamp must not become a row boundary or shrink the ring.'
+    $geometryRings = New-Object ZedColors.RingForm
+    $geometryBars = New-Object ZedColors.BoxForm
+    $forms += $geometryRings; $forms += $geometryBars
+    foreach ($dpi in @([single]1, [single]1.5, [single]2)) {
+        Set-Field $parserApp 'scale' $dpi
+        Set-Field $parserApp 'sidebar' (New-Object Drawing.Rectangle(0, 0, ([int](280 * $dpi)), ([int](360 * $dpi))))
+        $parserApp.BeginOcr()
+        $parserApp.AddWord(0, 'same-project', 32 * $dpi, 140 * $dpi, 220 * $dpi, 28 * $dpi)
+        $parserApp.AddWord(1, 'Build', 80 * $dpi, 200 * $dpi, 60 * $dpi, 28 * $dpi)
+        $parserApp.AddWord(2, 'API', 150 * $dpi, 200 * $dpi, 40 * $dpi, 28 * $dpi)
+        $parserApp.AddWord(3, '1', 200 * $dpi, 200 * $dpi, 14 * $dpi, 28 * $dpi)
+        $parserApp.AddWord(1, '1m', 80 * $dpi, 248 * $dpi, 30 * $dpi, 28 * $dpi)
+        $spatialRows = @(Invoke-Private $parserApp 'ReadRows')
+        Assert ($spatialRows.Count -eq 1) 'Visual line grouping must handle simultaneous split titles and merged timestamps at each DPI.'
+        $geometryRings.UiScale = $dpi; $geometryRings.Size = New-Object Drawing.Size(([int](280 * $dpi)), ([int](360 * $dpi)))
+        $geometryBars.UiScale = $dpi; $geometryBars.Size = New-Object Drawing.Size(([int](22 * $dpi)), ([int](360 * $dpi)))
+        $geometryRings.Rows.Clear(); $geometryRings.Rows.Add($spatialRows[0])
+        $ringBounds = $geometryRings.RingRect($spatialRows[0])
+        $barBounds = $geometryBars.BarRect($spatialRows[0])
+        Assert ($ringBounds.Top -lt 100 * $dpi -and $ringBounds.Bottom -gt 138 * $dpi) 'The ring must enclose both title and timestamp instead of crossing the title.'
+        Assert ($barBounds.Height -gt 35 * $dpi) 'The clickable color bar must retain its full height alongside a fragmented session.'
+        $bitmap = New-Object Drawing.Bitmap($geometryRings.Width, $geometryRings.Height)
+        $graphics = [Drawing.Graphics]::FromImage($bitmap)
+        try {
+            foreach ($status in @(1, 3, 1, 3)) {
+                $geometryRings.Dots[$spatialRows[0].Key] = $status
+                $graphics.Clear([Drawing.Color]::Transparent)
+                $null = Invoke-Private $geometryRings 'Draw' (, $graphics)
+                Assert ($geometryRings.RingRect($spatialRows[0]) -eq $ringBounds) 'Switching between working and waiting-for-input must never alter ring geometry.'
+            }
+        } finally { $graphics.Dispose(); $bitmap.Dispose() }
+    }
+    Set-Field $parserApp 'scale' ([single]1)
+    Set-Field $parserApp 'sidebar' (New-Object Drawing.Rectangle(0, 0, 280, 360))
+    $parserApp.BeginOcr()
     Add-SidebarLine 0 'same-projectv' 16 70
     Add-SidebarLine 1 'BuiId API 1' 40 100
     Add-SidebarLine 2 '1m' 40 124
@@ -908,7 +971,7 @@ public class FakeGitHub {
     Assert ($script:app.Retries -eq 1) 'Only the invalid window target should require an OCR retry.'
     Assert ($script:app.Captures -eq 3) 'A continuously changing sidebar must apply OCR before taking its next capture.'
     $null = [xml]([IO.File]::ReadAllText((Join-Path $root 'docs\overlay-preview.svg')))
-    'Passed: compilation, explicit Copilot task completion and green-ring propagation, pending-helper completion and nested-event guards, independent similar-title/project colors, missing-timestamp row sizing, canonical OCR color keys, ambiguous-session matching, floating-panel/inbox removal, GitHub tag progress rendering and OCR masking, per-project polling thresholds, running-workflow CLI selection and step progress, hover GitHub status and links, hover rendering and DPI, real-prompt filtering, helper counts and rendering, working/waiting status, new-session ring, saved colors, completion colors, Claude background lifecycles, cached hover prompts, history errors, JSON fallback, startup opt-in, responsive OCR, and preview SVG.'
+    'Passed: compilation, fragmented/merged OCR line sizing and input-state geometry at multiple DPIs, explicit Copilot task completion and green-ring propagation, pending-helper completion and nested-event guards, independent similar-title/project colors, missing-timestamp row sizing, canonical OCR color keys, ambiguous-session matching, floating-panel/inbox removal, GitHub tag progress rendering and OCR masking, per-project polling thresholds, running-workflow CLI selection and step progress, hover GitHub status and links, hover rendering and DPI, real-prompt filtering, helper counts and rendering, working/waiting status, new-session ring, saved colors, completion colors, Claude background lifecycles, cached hover prompts, history errors, JSON fallback, startup opt-in, responsive OCR, and preview SVG.'
 } finally {
     if ($null -ne $timer) { $timer.Stop(); $timer.Dispose() }
     if ($null -ne $worker) { $worker.Stop(); $worker.Dispose() }
