@@ -15,11 +15,12 @@ It works across projects and applications in Zed. Status and helper tracking use
 ## What it adds
 
 **In the threads sidebar**
-- **Color bar beside every thread.** Click it to tag the thread with one of 9 colors (from Zed's Ayu Mirage theme), right-click to clear. Colors only change when you change them.
+- **Color bar beside every thread.** Click it to tag the thread with one of 9 colors (from Zed's Ayu Mirage theme), right-click to clear. Colors only change when you change them. Assignments use exact project/title keys so similarly named sessions do not overwrite or inherit one another's colors; uniquely matched OCR text is normalized against Zed's saved names before lookup.
 - **Status ring around each thread.** Blue (gently pulsing) while the agent works, amber (pulsing) while it waits on your answer, green when it finishes. Green stays until you view the thread; if you're already viewing it, green appears briefly for five seconds.
+- **GitHub progress along the top of each session tag.** A thin blue bar fills as GitHub Actions steps finish for that thread's project. Queued runs or runs without measured steps show a moving segment instead of a guessed percentage. The bar clears when the workflow completes or its status becomes unavailable. It works independently of the agent's activity ring, does not intercept clicks, and does not change your saved thread color.
 - **Helper-agent dashes beneath the ring.** One blue dash per active helper, capped at six dashes with a **+** for more. The hover card shows the exact count, distinguishing "Working with 3 helper agents" from "Waiting for 3 helper agents." Background commands and finished helpers are not counted.
 - **Hover card.** Rest the mouse on a thread to see its status, what it did this turn, your last prompt and its usage, without opening it. Codex also shows recorded limit percentages and reset times. Claude and Copilot describe each command in one line; that description is shown instead of the command.
-- **GitHub status in the hover card.** The newest GitHub Actions run for the repo(s) in the hovered thread's folders: repository, workflow, branch, running percentage and completed steps, or passed/failed/cancelled status. Move onto the hover card and click **Open GitHub run** to view it. Results are kept separate for each thread's project folders, including when hovering a different project from the open thread. Loading, missing repositories, no runs, and failed checks are identified explicitly.
+- **GitHub status in the hover card.** The newest running GitHub Actions workflow for the repo(s) in that thread's folders, or the newest run when none is running: repository, workflow, branch, running percentage and completed steps, or passed/failed/cancelled status. Move onto the hover card and click **Open GitHub run** to view it. Results are kept separate for each thread's project folders. Visible projects are monitored in the background without needing to open or hover their threads: running/queued results refresh about every eight seconds and idle results about every 45 seconds, plus command time. Loading, missing repositories, no runs, and failed checks are identified explicitly.
 - **No floating Last Prompt or GitHub panels.** Thread details appear on hover, leaving the conversation area clear. Use Zed's own prompt-navigation shortcuts (`Ctrl+Alt+Shift+PageUp/PageDown`, `Ctrl+Alt+End`) and tray > **Usage summary** for more detail.
 
 **Windows you can open**
@@ -34,7 +35,7 @@ It works across projects and applications in Zed. Status and helper tracking use
 - Zed with the Threads Sidebar on the **left**.
 - One or more of: Claude Code (`claude-acp`), Codex (`codex-acp`), GitHub Copilot CLI (`github-copilot-cli`) in Zed's Agent Panel.
 - Windows' built-in text recognition, which comes with your Windows display language (English works).
-- Optional: the [GitHub CLI](https://cli.github.com/) (`gh`), signed in, for GitHub hover status.
+- Optional: the [GitHub CLI](https://cli.github.com/) (`gh`), signed in, for GitHub hover status and session-tag progress.
 
 ## Install
 
@@ -53,6 +54,7 @@ There is no Questions inbox or question-tracking protocol. Local global instruct
 - **Finding threads on screen.** Zed doesn't tell Windows where its sidebar rows are, so the overlay reads the sidebar with Windows' built-in text recognition (OCR) and lines up with the thread names. Recognition runs on a separate, low-priority worker, with one capture at a time so animated icons cannot prevent results from appearing. Results are discarded if Zed moves, resizes, minimizes, or loses focus while recognition runs. It matches names to a background-loaded copy of Zed's local thread database (read-only).
 - **Reading the agents.** Each agent keeps its conversation in local files (`~/.claude/projects`, `~/.codex/sessions`, `~/.copilot/session-state`). Search and usage read only the new part each time. The last-prompt reader checks a bounded portion of changed files. All history reading runs on a low-priority background thread, not on the interface thread.
 - **Claude background work.** Background jobs are tracked by task ID, including completions delivered as queued messages and helpers restarted through `SendMessage`. Duplicate notifications do not double-count a job or turn a finished thread blue again. A quiet background job is not assumed finished: after 30 minutes without recorded activity, the status says "No activity" and the working ring clears rather than turning green.
+- **Copilot completion.** Successful `session.task_complete` events end a task even when the final assistant action is the completion tool rather than a text-only reply. Real background helpers keep the ring blue until they finish; the last helper completion then ends the waiting state without requiring another assistant message. Helper-session completion events do not finish their parent.
 - **Nothing leaves your PC**, except the GitHub status checks through your own signed-in `gh` tool.
 - It keeps its own files in `%LOCALAPPDATA%\ZedThreadColors` (your colors, which threads you've seen, and a log).
 
@@ -60,6 +62,9 @@ There is no Questions inbox or question-tracking protocol. Local global instruct
 
 - **Windows only.** It uses Windows APIs throughout.
 - **Screen reading isn't perfect.** It tolerates small misreads, but an unusual sidebar layout or font size can confuse it. The log (tray > Open log) says what it saw.
+- **Missing timestamp text does not shrink session boxes.** Row sizing uses timestamp spacing measured from neighboring rows and retains that spacing across missed captures. Helper-dash masking covers only the drawn marks rather than erasing a full-width band beneath the tag.
+- **Existing colors are preserved.** Older project-spelling keys remain usable when Zed's database uniquely identifies the same session. No saved colors are reset or deleted; similar thread titles are never used as color aliases.
+- **Ambiguous names are not guessed.** If multiple saved sessions have the same title in the same project, the overlay cannot reliably distinguish their statuses from sidebar text alone. Give those sessions distinct titles; hover details identify unmatched/ambiguous rows instead of copying the newest session's status.
 - **Colors are Zed's Ayu Mirage theme**, hard-coded in the `Theme` class near the top of the script. Change them there to match another theme.
 - **"Needs you" uses word patterns** to find asks in a reply. It can miss one or include a sentence that isn't one.
 - **No plan limits for Claude or Copilot.** Their files don't record them, so only Codex shows a percentage.

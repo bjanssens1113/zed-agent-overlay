@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1040" height="580" viewBox="0 0 1040 580" role="img" aria-labelledby="title description">
   <title id="title">Zed Agent Overlay illustrative preview</title>
-  <desc id="description">Made-up agent threads demonstrate color tags and working, waiting, and finished rings. A sidebar hover card shows the last prompt, usage, and GitHub Actions progress. A Needs you window extracts an agent's question.</desc>
+  <desc id="description">Made-up agent threads demonstrate color tags and working, waiting, and finished rings. A thin GitHub progress bar fills the top of a session tag. A sidebar hover card shows the last prompt, usage, and GitHub Actions progress. A Needs you window extracts an agent's question.</desc>
   <rect width="1040" height="580" rx="14" fill="#1f2430"/>
   <g font-family="Segoe UI, Arial, sans-serif">
     <rect x="1" y="1" width="1038" height="42" rx="14" fill="#272d38"/>
@@ -12,6 +12,8 @@
     <path d="M250 78l5 5" stroke="#a6acb9" stroke-width="2"/>
     <text x="24" y="116" font-size="12" fill="#a6acb9">website</text>
     <rect x="14" y="134" width="252" height="57" rx="8" fill="#272d38" stroke="#72cffe" stroke-width="2"/>
+    <rect x="24" y="137" width="232" height="3" fill="#3b4252"/>
+    <rect x="24" y="137" width="116" height="3" fill="#72cffe"/>
     <rect x="20" y="144" width="5" height="37" rx="2" fill="#debffe"/>
     <text x="37" y="158" font-size="14" fill="#cccac2">Improve the landing page</text>
     <text x="37" y="178" font-size="11" fill="#72cffe">Claude / Working with 3 helpers</text>

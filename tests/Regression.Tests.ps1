@@ -118,7 +118,6 @@ try {
     Assert ($rings.Dots[$row.Key] -eq 1) 'The newly discovered session must receive a blue working ring.'
     $form.Host = $hostApp
     Set-Field $hostApp 'colors' (New-Object 'System.Collections.Generic.Dictionary[string,int]')
-    Set-Field $hostApp 'aliases' (New-Object 'System.Collections.Generic.Dictionary[string,string]')
     Set-Field $hostApp 'dataPath' (Join-Path $temp 'colors.tsv')
     $hostApp.SetColor($row.Key, 4)
     Assert ($hostApp.ColorIndex($row.Key) -eq 4 -and $rings.Dots[$row.Key] -eq 1) 'Changing a saved thread color must not change its working status.'
@@ -126,11 +125,79 @@ try {
     $hostApp.SetColor($row.Key, 2)
     Assert ($hostApp.ColorIndex($row.Key) -eq 2 -and $hostApp.ColorIndex('differentworkspace|examplethread') -eq 7) 'Changing one thread color must leave the same title in another workspace unchanged.'
     Set-Field $hostApp 'colors' (New-Object 'System.Collections.Generic.Dictionary[string,int]')
-    Set-Field $hostApp 'aliases' (New-Object 'System.Collections.Generic.Dictionary[string,string]')
     $null = Invoke-Private $hostApp 'Load'
     Assert ($hostApp.ColorIndex($row.Key) -eq 2 -and $hostApp.ColorIndex('differentworkspace|examplethread') -eq 7) 'Saved color changes must survive reloading.'
     $hostApp.SetColor($row.Key, 0)
     Assert ($hostApp.ColorIndex($row.Key) -eq 0 -and $hostApp.ColorIndex('differentworkspace|examplethread') -eq 7) 'Clearing one color must not clear another workspace.'
+    $hostApp.SetColor('sample|buildapi1', 4)
+    $hostApp.SetColor('sample|buildapi2', 7)
+    Assert ($hostApp.ColorIndex('sample|buildapi1') -eq 4 -and $hostApp.ColorIndex('sample|buildapi2') -eq 7) 'Similar session titles in the same project must have independent editable colors.'
+    $hostApp.SetColor('sample|buildapi2', 0)
+    Assert ($hostApp.ColorIndex('sample|buildapi1') -eq 4 -and $hostApp.ColorIndex('sample|buildapi2') -eq 0) 'Clearing a neighboring session color must not clear or inherit another session color.'
+    $hostApp.SetColor('samples|buildapi1', 7)
+    Assert ($hostApp.ColorIndex('sample|buildapi1') -eq 4 -and $hostApp.ColorIndex('samples|buildapi1') -eq 7) 'Nearly identical project names must not share color assignments.'
+    Set-Field $hostApp 'colors' (New-Object 'System.Collections.Generic.Dictionary[string,int]')
+    $null = Invoke-Private $hostApp 'Load'
+    Assert ($hostApp.ColorIndex('sample|buildapi1') -eq 4 -and $hostApp.ColorIndex('samples|buildapi1') -eq 7) 'Independent colors must remain independent after a restart.'
+
+    $parserApp = [Runtime.Serialization.FormatterServices]::GetUninitializedObject([ZedColors.App])
+    Set-Field $parserApp 'words' (New-Object 'System.Collections.Generic.List[ZedColors.Word]')
+    Set-Field $parserApp 'scale' ([single]1)
+    Set-Field $parserApp 'sidebar' (New-Object Drawing.Rectangle(0, 0, 280, 360))
+    $parserThreads = New-Object 'System.Collections.Generic.List[ZedColors.ThreadInfo]'
+    foreach ($name in @('Build API 1', 'Build API 2', 'GitHub Help')) {
+        $t = New-Object ZedColors.ThreadInfo
+        $t.Session = [Guid]::NewGuid().ToString(); $t.Display = $name
+        $t.Folders = Join-Path $temp 'same-project'; $t.Agent = 'github-copilot-cli'
+        $parserThreads.Add($t)
+    }
+    Set-Field $parserApp 'threads' $parserThreads
+    function Add-SidebarLine([int]$line, [string]$value, [double]$x, [double]$y) {
+        $parserApp.AddWord($line, $value, $x * 2, $y * 2, 150 * 2, 14 * 2)
+    }
+    function Sample-Sidebar([bool]$middleTimestamp) {
+        $parserApp.BeginOcr()
+        Add-SidebarLine 0 'same-project' 16 70
+        Add-SidebarLine 1 'Build API 1' 40 100
+        Add-SidebarLine 2 '1m' 40 124
+        Add-SidebarLine 3 'Build API 2' 40 160
+        if ($middleTimestamp) { Add-SidebarLine 4 '2m' 40 184 }
+        Add-SidebarLine 5 'GitHub Help' 40 220
+        Add-SidebarLine 6 '3m' 40 244
+        return @(Invoke-Private $parserApp 'ReadRows')
+    }
+    $completeRows = Sample-Sidebar $true
+    $missingRows = Sample-Sidebar $false
+    Assert ($completeRows.Count -eq 3 -and $missingRows.Count -eq 3) 'Multiple agents in one project must each retain one sidebar row.'
+    Assert ($missingRows[1].RowTop -eq $completeRows[1].RowTop -and $missingRows[1].RowBottom -eq $completeRows[1].RowBottom) 'Missing timestamp OCR must not shrink the session ring or its clickable color bar.'
+    Assert ($missingRows[1].RowBottom -lt $missingRows[2].RowTop) 'Recovered full-height session boxes must not overlap their neighboring agent.'
+    $parserApp.BeginOcr()
+    Add-SidebarLine 0 'same-project' 16 70
+    Add-SidebarLine 1 'Build API 1' 40 100
+    Add-SidebarLine 3 'Build API 2' 40 160
+    Add-SidebarLine 5 'GitHub Help' 40 220
+    $allMissingRows = @(Invoke-Private $parserApp 'ReadRows')
+    Assert ($allMissingRows[1].RowBottom -eq $completeRows[1].RowBottom) 'Previously measured timestamp spacing must survive a capture where every timestamp is missed.'
+    $parserApp.BeginOcr()
+    Add-SidebarLine 0 'same-projectv' 16 70
+    Add-SidebarLine 1 'BuiId API 1' 40 100
+    Add-SidebarLine 2 '1m' 40 124
+    $correctedRows = @(Invoke-Private $parserApp 'ReadRows')
+    Assert ($correctedRows[0].Key -eq 'sameproject|buildapi1') 'Unique database matches must canonicalize project and title OCR errors before color lookup.'
+    $parserColors = New-Object 'System.Collections.Generic.Dictionary[string,int]'
+    $parserColors.Add('sameprojectv|buildapi1', 4)
+    Set-Field $parserApp 'colors' $parserColors
+    $correctedRows = @(Invoke-Private $parserApp 'ReadRows')
+    Assert ($correctedRows[0].Key -eq 'sameprojectv|buildapi1' -and $parserApp.ColorIndex($correctedRows[0].Key) -eq 4) 'An existing project OCR spelling must retain its saved color when it uniquely identifies the same session.'
+    $parserColors.Add('sameproject|buildapi1', 7)
+    $correctedRows = @(Invoke-Private $parserApp 'ReadRows')
+    Assert ($correctedRows[0].Key -eq 'sameproject|buildapi1' -and $parserApp.ColorIndex($correctedRows[0].Key) -eq 7) 'An explicit canonical color must take precedence over an older project-spelling key.'
+    Assert ($null -eq (Invoke-Private $parserApp 'MatchThread' @('other-project', 'Build API 1'))) 'A title in another project must not borrow an agent status from this project.'
+    $duplicate = New-Object ZedColors.ThreadInfo
+    $duplicate.Session = [Guid]::NewGuid().ToString()
+    $duplicate.Display = $parserThreads[0].Display; $duplicate.Folders = $parserThreads[0].Folders
+    $parserThreads.Add($duplicate)
+    Assert ($null -eq (Invoke-Private $parserApp 'MatchThread' @('same-project', 'Build API 1'))) 'Ambiguous same-title sessions must not all inherit the newest agent status.'
     Set-Field $hostApp 'active' $info
     [IO.File]::Delete($file)
     $hoverLines = Invoke-Private $hostApp 'CardLines' (, $row)
@@ -217,7 +284,12 @@ try {
             }
         }
         Assert ($plusPixels -gt 0) 'Counts over six must render a visible plus sign after the six dashes.'
-    } finally { $graphics.Dispose(); $drawing.Dispose() }
+        $rings.ActiveHelpers[$row.Key] = 1
+        $rings.Show()
+        $helper = $rings.HelperRects($row)[0]
+        $clearPoint = New-Object Drawing.Point([int]($rings.RingRect($row).Right - 10 + $rings.Left), [int][Math]::Ceiling($helper.Bottom + $rings.Top))
+        Assert (@($rings.Bands() | Where-Object {$_[0].Contains($clearPoint)}).Count -eq 0) 'Masking a helper dash must not erase an entire horizontal strip beneath the session tag.'
+    } finally { $rings.Hide(); $graphics.Dispose(); $drawing.Dispose() }
 
     $claude = New-Object ZedColors.FileScan
     $claude.Kind = 'claude'; $claude.WantText = $true; $claude.Path = Join-Path $temp 'claude.jsonl'
@@ -375,6 +447,46 @@ try {
     Assert ($copilot.ActiveHelpers -eq 0 -and $copilot.Background -eq 0) 'A failed background launch must not leave a stuck dash.'
     Copilot-Event @{ type = 'subagent.completed'; timestamp = $now; data = @{ toolCallId = 'launch-failed' } }
     Assert ($copilot.ActiveHelpers -eq 0) 'A completion after launch failure must remain harmless.'
+    Copilot-Event @{ type = 'user.message'; timestamp = $now; data = @{ content = 'Complete this task' } }
+    Copilot-Event @{ type = 'assistant.message'; timestamp = $now; data = @{
+        toolRequests = @(@{ toolCallId = 'finish-task'; name = 'task_complete'; arguments = @{ summary = 'Finished' } })
+    } }
+    Copilot-Event @{ type = 'tool.execution_start'; timestamp = $now; data = @{ toolName = 'task_complete'; toolCallId = 'finish-task' } }
+    Copilot-Event @{ type = 'tool.execution_complete'; timestamp = $now; data = @{ toolCallId = 'finish-task'; success = $true } }
+    Assert $copilot.Working 'A completed tool alone must not prematurely finish the agent turn.'
+    Copilot-Event @{ type = 'session.task_complete'; timestamp = $now; data = @{ success = $true; parentToolCallId = 'nested-helper' } }
+    Assert $copilot.Working 'A helper session completion must not finish the parent agent.'
+    Copilot-Event @{ type = 'session.task_complete'; timestamp = $now; data = @{ success = $false } }
+    Assert $copilot.Working 'A rejected task-completion event must not finish the agent.'
+    Copilot-Event @{ type = 'session.task_complete'; timestamp = $now; data = @{ success = $true } }
+    Assert (-not $copilot.Working -and $copilot.TurnEnd -ne [DateTime]::MinValue) 'Successful Copilot session.task_complete must finish even when its final assistant message requested the completion tool.'
+    $end = $copilot.TurnEnd
+    Copilot-Event @{ type = 'assistant.turn_end'; timestamp = [DateTime]::UtcNow.AddSeconds(1).ToString('o'); data = @{} }
+    Assert (-not $copilot.Working -and $copilot.TurnEnd -eq $end) 'The following turn-end event must not restart or re-date a completed task.'
+    Copilot-Event @{ type = 'assistant.turn_start'; timestamp = $now; data = @{ parentToolCallId = 'finished-helper' } }
+    Copilot-Event @{ type = 'tool.execution_start'; timestamp = $now; data = @{
+        toolName = 'powershell'; toolCallId = 'late-helper-tool'; parentToolCallId = 'finished-helper'
+    } }
+    Assert (-not $copilot.Working) 'Late nested helper events must not turn a completed parent blue again.'
+    $completionDoc = New-Object ZedColors.ThreadDoc
+    $completionDoc.Info = $info; $completionDoc.File = $copilot.Path
+    (Get-Field $indexer 'scans')[$copilot.Path] = $copilot
+    $completionDocs = New-Object 'System.Collections.Generic.List[ZedColors.ThreadDoc]'
+    $completionDocs.Add($completionDoc)
+    $null = Invoke-Private $indexer 'PublishUsage' (, $completionDocs)
+    $indexer.Usage.BySession[$info.Session].TurnEnd = [DateTime]::Now
+    $null = Invoke-Private $hostApp 'UpdateDots'
+    Assert ($rings.Dots[$row.Key] -eq 2) 'The successful completion event must propagate through the published snapshot to a green sidebar ring.'
+    Copilot-Event @{ type = 'user.message'; timestamp = $now; data = @{ content = 'Finish after the helper' } }
+    Copilot-Event @{ type = 'tool.execution_start'; timestamp = $now; data = @{
+        toolName = 'task'; toolCallId = 'pending-finish'; arguments = @{ mode = 'background' }
+    } }
+    Copilot-Event @{ type = 'session.task_complete'; timestamp = $now; data = @{ success = $true } }
+    Assert ($copilot.Working -and $copilot.WaitingForBackground) 'Task completion must retain blue while a real background helper is still running.'
+    Copilot-Event @{ type = 'subagent.completed'; timestamp = $now; data = @{ toolCallId = 'pending-finish' } }
+    Assert (-not $copilot.Working -and $copilot.Background -eq 0) 'Finishing the last background helper after main-task completion must clear working without requiring another assistant message.'
+    Copilot-Event @{ type = 'user.message'; timestamp = $now; data = @{ content = 'A new task' } }
+    Assert ($copilot.Working -and -not $copilot.WaitingForBackground) 'A new human prompt must restore normal blue working state.'
 
     [IO.File]::AppendAllText($file, '{"type":"user.message","data":' + "`n")
     $broken = New-Object ZedColors.ThreadDoc
@@ -424,15 +536,73 @@ try {
         $snapshot = New-Object ZedColors.CiSnapshot
         $snapshot.Run = $ciInfo
         $null = Invoke-Private $ciWatcher 'Publish' @($info.Folders, $snapshot)
+        $hostApp.OnCi()
+        Assert ($rings.GitHubProgress[$row.Key] -eq 50) 'Running GitHub steps must reach the top-of-session progress bar.'
+        $originalDots = $rings.Dots[$row.Key]
+        $ciInfo.StepsDone = 3
+        $hostApp.OnCi()
+        Assert ($rings.GitHubProgress[$row.Key] -eq 75 -and $rings.Dots[$row.Key] -eq $originalDots) 'GitHub progress must update independently of the agent activity ring.'
+        $ciInfo.StepsDone = 2
+        $hostApp.OnCi()
+        foreach ($dpi in @([single]1, [single]1.5, [single]2)) {
+            $rings.UiScale = $dpi
+            $rings.Width = [int](230 * $dpi); $rings.Height = [int](140 * $dpi)
+            $track = $rings.GitHubTrack($row)
+            Assert ($track.Top -ge $rings.RingRect($row).Top -and $track.Bottom -le $rings.RingRect($row).Top + 6 * $dpi) 'The GitHub bar must remain at the top of the session tag, clear of its title.'
+            foreach ($percent in @(0, 25, 50, 100)) {
+                $rings.GitHubProgress[$row.Key] = $percent
+                $fill = $rings.GitHubFill($row, 0)
+                Assert ([Math]::Abs($fill.Width - $track.Width * $percent / 100) -lt 0.01) 'The rendered progress width must match the actual percentage at every DPI.'
+                Assert ($fill.Left -eq $track.Left -and $fill.Right -le $track.Right + 0.01) 'Measured progress must fill left-to-right without overflowing the tag.'
+            }
+            $rings.GitHubProgress[$row.Key] = -1
+            $first = $rings.GitHubFill($row, 0)
+            $next = $rings.GitHubFill($row, 0.5)
+            Assert ($first.X -ne $next.X -and $next.Right -le $track.Right + 0.01) 'Unmeasured progress must animate within the tag rather than invent a percentage.'
+        }
+        $rings.UiScale = 1; $rings.Width = 230; $rings.Height = 140
+        $rings.Dots.Clear(); $rings.ActiveHelpers.Clear(); $rings.GitHubProgress[$row.Key] = 50
+        Assert $rings.AnyRings() 'A GitHub progress bar must remain drawable even when the agent is idle.'
+        $ringParams = $rings.GetType().GetProperty('CreateParams', [Reflection.BindingFlags]'Instance, NonPublic').GetValue($rings)
+        Assert (($ringParams.ExStyle -band 0x20) -ne 0) 'GitHub progress must not intercept clicks on Zed session tags.'
+        $drawing = New-Object Drawing.Bitmap(230, 140)
+        $graphics = [Drawing.Graphics]::FromImage($drawing)
+        try {
+            $graphics.Clear([Drawing.Color]::Transparent)
+            $null = Invoke-Private $rings 'Draw' (, $graphics)
+            $track = $rings.GitHubTrack($row)
+            $filled = $drawing.GetPixel([int]($track.Left + $track.Width / 4), [int]($track.Top + 1))
+            $remaining = $drawing.GetPixel([int]($track.Left + $track.Width * 3 / 4), [int]($track.Top + 1))
+            Assert ($filled.A -gt 200 -and $filled.B -gt 150 -and $remaining.A -lt 100) 'The actual drawing must show a blue 50% fill and a subdued remainder without an agent ring.'
+            $rings.Show()
+            $screenTrack = [Drawing.Rectangle]::Ceiling($track)
+            $screenTrack.Offset($rings.Left, $rings.Top)
+            $bands = $rings.Bands()
+            Assert (@($bands | Where-Object {$_[0].Contains($screenTrack)}).Count -gt 0) 'The OCR mask must cover GitHub progress independently of agent rings.'
+            $pixels = New-Object 'int[]' (230 * 140)
+            for ($i = 0; $i -lt $pixels.Length; $i++) { $pixels[$i] = 0x111111 }
+            for ($y = $screenTrack.Top; $y -lt $screenTrack.Bottom; $y++) {
+                for ($x = $screenTrack.Left; $x -lt $screenTrack.Right; $x++) { $pixels[($y - $rings.Top) * 230 + $x - $rings.Left] = 0x72cffe }
+            }
+            $null = Invoke-Private $hostApp 'ScrubRings' @($pixels, 230, 140, $rings.Left, $rings.Top)
+            Assert (@($pixels | Where-Object {$_ -ne 0x111111}).Count -eq 0) 'Progress animation must be fully removed from OCR captures so it cannot destabilize colors or session matching.'
+        } finally {
+            $rings.Hide(); $graphics.Dispose(); $drawing.Dispose()
+        }
+        $hostApp.OnCi()
         $hoverLines = Invoke-Private $hostApp 'CardLines' (, $row)
         Assert (@($hoverLines | Where-Object {$_.Text -like '*example/sample*Build*'}).Count -eq 1) 'Hover GitHub status must identify the repository and workflow.'
         Assert (@($hoverLines | Where-Object {$_.Text -like '*50% (2 of 4 steps)*main*'}).Count -eq 1) 'Hover GitHub status must show actual progress, step counts, and branch.'
         Assert (@($hoverLines | Where-Object {$_.Text -eq 'Verify the sample' -and $_.Url -eq $ciInfo.Url}).Count -eq 1) 'The run title must link to the originating GitHub run.'
         foreach ($status in @('queued', 'pending', 'waiting')) {
             $ciInfo.Status = $status
+            $hostApp.OnCi()
+            Assert ($rings.GitHubProgress[$row.Key] -eq -1) 'Queued GitHub runs must use unmeasured animation.'
             Assert ($ciInfo.StatusText -eq 'Queued') 'Queued runs must not look like completed runs or measured progress.'
         }
         $ciInfo.Status = 'in_progress'; $ciInfo.StepsTotal = 0
+        $hostApp.OnCi()
+        Assert ($rings.GitHubProgress[$row.Key] -eq -1) 'GitHub runs without measured steps must not show a fabricated percentage.'
         Assert ($ciInfo.StatusText -eq 'Running') 'Unmeasured progress must not be presented as a fabricated percentage.'
         $ciInfo.Status = 'completed'
         foreach ($state in @(
@@ -440,6 +610,8 @@ try {
             @('skipped', 'Skipped'), @('timed_out', 'Timed out'), @('startup_failure', 'Startup failure')
         )) {
             $ciInfo.Conclusion = $state[0]
+            $hostApp.OnCi()
+            Assert (-not $rings.GitHubProgress.ContainsKey($row.Key)) 'The top progress bar must clear after every completed GitHub outcome.'
             $hoverLines = Invoke-Private $hostApp 'CardLines' (, $row)
             Assert (@($hoverLines | Where-Object {$_.Text -like ($state[1] + '*main*')}).Count -eq 1) "GitHub conclusion $($state[0]) must be visible in the hover card."
             if ($state[0] -eq 'success') {
@@ -456,6 +628,7 @@ try {
         $indexer.Index.Docs.Add($otherDoc)
         $null = Invoke-Private $hostApp 'LoadThreads'
         $otherRow = New-Object ZedColors.Row
+        $otherRow.Key = 'other-workspace|otherthread'
         $otherRow.Title = $otherInfo.Display; $otherRow.Project = 'other-workspace'
         $hoverLines = Invoke-Private $hostApp 'CardLines' (, $otherRow)
         Assert (@($hoverLines | Where-Object {$_.Text -eq 'Checking GitHub Actions...'}).Count -eq 1) 'An unqueried hovered project must not inherit the open thread GitHub result.'
@@ -477,6 +650,93 @@ try {
         $null = Invoke-Private $ciWatcher 'Publish' @($otherFolder, $emptySnapshot)
         $hoverLines = Invoke-Private $hostApp 'CardLines' (, $otherRow)
         Assert (@($hoverLines | Where-Object {$_.Text -eq $emptySnapshot.Message}).Count -eq 1) 'A repository without Actions runs must be distinct from a failed check.'
+        $form.Rows.Add($otherRow)
+        $ciInfo.Status = 'in_progress'; $ciInfo.StepsTotal = 4
+        $hostApp.OnCi()
+        Assert ($rings.GitHubProgress[$row.Key] -eq 50 -and -not $rings.GitHubProgress.ContainsKey($otherRow.Key)) 'A running project must not add a progress bar to another project.'
+        $otherRun = New-Object ZedColors.CiInfo
+        $otherRun.Status = 'in_progress'; $otherRun.StepsDone = 1; $otherRun.StepsTotal = 4
+        $otherSnapshot = New-Object ZedColors.CiSnapshot
+        $otherSnapshot.Run = $otherRun
+        $null = Invoke-Private $ciWatcher 'Publish' @($otherFolder, $otherSnapshot)
+        $hostApp.OnCi()
+        Assert ($rings.GitHubProgress[$row.Key] -eq 50 -and $rings.GitHubProgress[$otherRow.Key] -eq 25) 'Simultaneous GitHub runs must display their own project progress, even without an agent turn.'
+        $nowUtc = [DateTime]::UtcNow
+        $snapshot.CheckedUtc = $nowUtc.AddSeconds(-7)
+        $otherSnapshot.CheckedUtc = $nowUtc.AddSeconds(-8)
+        $due = @(Invoke-Private $ciWatcher 'DueFolders' (, $nowUtc))
+        Assert ($due.Count -eq 1 -and $due[0] -eq $otherFolder) 'Each running visible project must be polled independently at the eight-second threshold.'
+        $ciInfo.Status = 'completed'; $snapshot.CheckedUtc = $nowUtc.AddSeconds(-44)
+        $otherRun.Status = 'completed'; $otherSnapshot.CheckedUtc = $nowUtc
+        Assert ((Invoke-Private $ciWatcher 'DueFolders' (, $nowUtc)).Count -eq 0) 'Idle projects must not be polled on every UI refresh.'
+        $snapshot.CheckedUtc = $nowUtc.AddSeconds(-45)
+        $due = @(Invoke-Private $ciWatcher 'DueFolders' (, $nowUtc))
+        Assert ($due.Count -eq 1 -and $due[0] -eq $info.Folders) 'Idle visible projects must still be checked at the 45-second threshold for new runs.'
+        $ciWatcher.SetVisibleFolders((New-Object 'System.Collections.Generic.List[string]'))
+        Assert ((Invoke-Private $ciWatcher 'DueFolders' (, $nowUtc)).Count -eq 0) 'Projects that leave the sidebar must stop polling unless open or hovered.'
+        $hostApp.OnCi()
+        Assert ($rings.GitHubProgress.Count -eq 0) 'Completing simultaneous GitHub runs must clear every progress bar.'
+        $null = Invoke-Private $ciWatcher 'Publish' @($info.Folders, $errorSnapshot)
+        $hostApp.OnCi()
+        Assert (-not $rings.GitHubProgress.ContainsKey($row.Key)) 'Unavailable GitHub status must never leave a stale working bar behind.'
+        $null = Invoke-Private $ciWatcher 'Publish' @($info.Folders, $snapshot)
+        $fakeGh = Join-Path $temp 'fake-gh'
+        $fakeRepo = Join-Path $fakeGh 'repository'
+        $null = [IO.Directory]::CreateDirectory((Join-Path $fakeRepo '.git'))
+        [IO.File]::WriteAllText((Join-Path $fakeRepo '.git\config'), "[remote `"origin`"]`nurl = https://github.com/example/sample.git`n")
+        $fakeSource = @'
+using System;
+using System.IO;
+public class FakeGitHub {
+    public static int Main(string[] args) {
+        string dir = Environment.GetEnvironmentVariable("ZED_TEST_GITHUB");
+        File.AppendAllText(Path.Combine(dir, "calls.txt"), string.Join(" ", args) + "\n");
+        if (File.Exists(Path.Combine(dir, "fail"))) {
+            Console.Error.WriteLine("Synthetic GitHub failure");
+            return 1;
+        }
+        string file = args[1] == "view" ? "jobs.json"
+            : Array.IndexOf(args, "--status") >= 0 ? "active.json" : "latest.json";
+        Console.Write(File.ReadAllText(Path.Combine(dir, file)));
+        return 0;
+    }
+}
+'@
+        Add-Type -TypeDefinition $fakeSource -OutputAssembly (Join-Path $fakeGh 'gh.exe') -OutputType ConsoleApplication
+        $oldPath = $env:PATH; $oldFakeGitHub = $env:ZED_TEST_GITHUB
+        try {
+            $env:PATH = $fakeGh + ';' + $oldPath
+            $env:ZED_TEST_GITHUB = $fakeGh
+            $activeRun = @{
+                databaseId = 100; status = 'in_progress'; workflowName = 'Build'; displayTitle = 'An older running build'
+                createdAt = [DateTime]::UtcNow.AddMinutes(-2).ToString('o')
+                updatedAt = [DateTime]::UtcNow.ToString('o'); headBranch = 'main'
+                url = 'https://github.com/example/sample/actions/runs/100'
+            }
+            $latestRun = @{
+                databaseId = 200; status = 'completed'; conclusion = 'success'; workflowName = 'Lint'
+                displayTitle = 'A newer completed lint run'; createdAt = [DateTime]::UtcNow.ToString('o')
+                url = 'https://github.com/example/sample/actions/runs/200'
+            }
+            [IO.File]::WriteAllText((Join-Path $fakeGh 'active.json'), (ConvertTo-Json -InputObject @($activeRun) -Compress))
+            [IO.File]::WriteAllText((Join-Path $fakeGh 'latest.json'), (ConvertTo-Json -InputObject @($latestRun) -Compress))
+            $jobs = @{ jobs = @(@{ steps = @(
+                @{ status = 'completed' }, @{ status = 'completed' }, @{ status = 'in_progress' }, @{ status = 'pending' }
+            ) }) }
+            [IO.File]::WriteAllText((Join-Path $fakeGh 'jobs.json'), ($jobs | ConvertTo-Json -Depth 10 -Compress))
+            $null = Invoke-Private $ciWatcher 'Poll' (, $fakeRepo)
+            $polled = $ciWatcher.SnapshotFor($fakeRepo)
+            Assert ($polled.Run.Url -like '*/100' -and $polled.Run.Percent -eq 50) 'Actual CLI polling must prefer a running workflow and calculate progress from completed GitHub steps.'
+            Assert ([IO.File]::ReadAllText((Join-Path $fakeGh 'calls.txt')).Contains('run view 100')) 'Measured progress must come from the selected running workflow jobs.'
+            [IO.File]::WriteAllText((Join-Path $fakeGh 'active.json'), '[]')
+            $null = Invoke-Private $ciWatcher 'Poll' (, $fakeRepo)
+            Assert ($ciWatcher.SnapshotFor($fakeRepo).Run.Conclusion -eq 'success') 'When no workflow is running, polling must retain the newest completed run for hover details.'
+            [IO.File]::WriteAllText((Join-Path $fakeGh 'fail'), '')
+            $null = Invoke-Private $ciWatcher 'Poll' (, $fakeRepo)
+            Assert ($null -eq $ciWatcher.SnapshotFor($fakeRepo).Run -and $null -ne $ciWatcher.SnapshotFor($fakeRepo).Message) 'A CLI failure must replace stale running data with an explicit unavailable state.'
+        } finally {
+            $env:PATH = $oldPath; $env:ZED_TEST_GITHUB = $oldFakeGitHub
+        }
         $oldAgent = $info.Agent
         $oldLimit = $indexer.Usage.CodexPrimary
         try {
@@ -648,7 +908,7 @@ try {
     Assert ($script:app.Retries -eq 1) 'Only the invalid window target should require an OCR retry.'
     Assert ($script:app.Captures -eq 3) 'A continuously changing sidebar must apply OCR before taking its next capture.'
     $null = [xml]([IO.File]::ReadAllText((Join-Path $root 'docs\overlay-preview.svg')))
-    'Passed: compilation, floating-panel/inbox removal, hover GitHub status and links, per-project CI snapshots, hover rendering and DPI, real-prompt filtering, helper counts and rendering, working/waiting status, new-session ring, saved colors, completion colors, Claude background lifecycles, cached hover prompts, history errors, JSON fallback, startup opt-in, responsive OCR, and preview SVG.'
+    'Passed: compilation, explicit Copilot task completion and green-ring propagation, pending-helper completion and nested-event guards, independent similar-title/project colors, missing-timestamp row sizing, canonical OCR color keys, ambiguous-session matching, floating-panel/inbox removal, GitHub tag progress rendering and OCR masking, per-project polling thresholds, running-workflow CLI selection and step progress, hover GitHub status and links, hover rendering and DPI, real-prompt filtering, helper counts and rendering, working/waiting status, new-session ring, saved colors, completion colors, Claude background lifecycles, cached hover prompts, history errors, JSON fallback, startup opt-in, responsive OCR, and preview SVG.'
 } finally {
     if ($null -ne $timer) { $timer.Stop(); $timer.Dispose() }
     if ($null -ne $worker) { $worker.Stop(); $worker.Dispose() }

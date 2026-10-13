@@ -7,6 +7,7 @@
 #   last opened the thread (or a five-second green flash if already open).
 #   Clicks pass straight through the ring to Zed.
 #   Blue dashes below a ring show active helper agents (up to six dashes, then +).
+#   A thin bar at the top of a thread shows its project's running GitHub Actions progress.
 #   Rest the mouse on a thread in the sidebar for a card with its status, your last prompt, and usage.
 # Needs you: an amber (pulsing) ring when an agent asks you a question; a Windows notification when a
 #   thread asks you something or finishes while you're not looking at it. The bell button under the
@@ -441,6 +442,7 @@ namespace ZedColors
         public List<Row> Rows = new List<Row>();
         public Dictionary<string, int> Dots = new Dictionary<string, int>(); // row key -> 1 working, 2 done
         public Dictionary<string, int> ActiveHelpers = new Dictionary<string, int>();
+        public Dictionary<string, int> GitHubProgress = new Dictionary<string, int>(); // percent, or -1 when unmeasured
         public const int MaxHelperDashes = 6;
         System.Windows.Forms.Timer pulse;
         DateTime t0 = DateTime.Now;
@@ -482,9 +484,25 @@ namespace ZedColors
             return Rectangle.Ceiling(new RectangleF(ring.X, ring.Bottom + Px(2), ring.Width, Px(12)));
         }
 
+        public RectangleF GitHubTrack(Row r)
+        {
+            RectangleF ring = RingRect(r);
+            return new RectangleF(ring.X + Px(8), ring.Top + Px(2), Math.Max(0, ring.Width - Px(16)), Math.Max(2, Px(3)));
+        }
+
+        public RectangleF GitHubFill(Row r, double seconds)
+        {
+            int progress;
+            if (!GitHubProgress.TryGetValue(r.Key, out progress)) return RectangleF.Empty;
+            RectangleF track = GitHubTrack(r);
+            float width = progress < 0 ? track.Width * 0.25f : track.Width * Math.Max(0, Math.Min(100, progress)) / 100f;
+            float offset = progress < 0 ? (float)(0.5 + 0.5 * Math.Sin(seconds * Math.PI)) * (track.Width - width) : 0;
+            return new RectangleF(track.X + offset, track.Y, width, track.Height);
+        }
+
         public bool AnyRings()
         {
-            foreach (Row r in Rows) { int d; if (Dots.TryGetValue(r.Key, out d) && d > 0) return true; }
+            foreach (Row r in Rows) { int d; if ((Dots.TryGetValue(r.Key, out d) && d > 0) || GitHubProgress.ContainsKey(r.Key)) return true; }
             return false;
         }
 
@@ -527,6 +545,17 @@ namespace ZedColors
                         using (SolidBrush brush = new SolidBrush(Theme.Working))
                             g.DrawString("+", font, brush, bars[bars.Length - 1].Right + Px(3), bars[0].Top - Px(4));
             }
+            foreach (Row r in Rows)
+            {
+                int progress;
+                if (!GitHubProgress.TryGetValue(r.Key, out progress)) continue;
+                if (progress < 0) working = true;
+                RectangleF track = GitHubTrack(r), fill = GitHubFill(r, t);
+                if (track.Width <= 0) continue;
+                using (SolidBrush brush = new SolidBrush(Color.FromArgb(75, Theme.Working))) g.FillRectangle(brush, track);
+                if (fill.Width > 0)
+                    using (SolidBrush brush = new SolidBrush(Theme.Working)) g.FillRectangle(brush, fill);
+            }
             if (working && !pulse.Enabled) pulse.Start();
             if (!working && pulse.Enabled) pulse.Stop();
         }
@@ -547,15 +576,31 @@ namespace ZedColors
                 int o = (int)Math.Ceiling(PenW / 2 + GlowW + 2), i = (int)Math.Ceiling(PenW / 2 + 2);
                 outer.Inflate(o, o);
                 inner.Inflate(-i, -i);
-                int helpers;
-                if (ActiveHelpers.TryGetValue(r.Key, out helpers) && helpers > 0)
-                {
-                    Rectangle band = HelperBand(r);
-                    band.Offset(Left, Top);
-                    outer = Rectangle.Union(outer, band);
-                }
                 l.Add(new Rectangle[] { outer, inner });
+                foreach (RectangleF helper in HelperRects(r))
+                {
+                    Rectangle band = Rectangle.Ceiling(helper);
+                    band.Inflate(1, 1);
+                    band.Offset(Left, Top);
+                    l.Add(new Rectangle[] { band, new Rectangle(band.Left, band.Bottom, band.Width, 0) });
+                }
+                int count;
+                RectangleF[] bars = HelperRects(r);
+                if (bars.Length > 0 && ActiveHelpers.TryGetValue(r.Key, out count) && count > MaxHelperDashes)
+                {
+                    Rectangle band = Rectangle.Ceiling(new RectangleF(bars[bars.Length - 1].Right + Px(3), bars[0].Top - Px(4), Px(12), Px(14)));
+                    band.Offset(Left, Top);
+                    l.Add(new Rectangle[] { band, new Rectangle(band.Left, band.Bottom, band.Width, 0) });
+                }
             }
+            foreach (Row r in Rows)
+                if (GitHubProgress.ContainsKey(r.Key))
+                {
+                    Rectangle band = Rectangle.Ceiling(GitHubTrack(r));
+                    band.Inflate(1, 1);
+                    band.Offset(Left, Top);
+                    l.Add(new Rectangle[] { band, new Rectangle(band.Left, band.Bottom, band.Width, 0) });
+                }
             return l;
         }
     }
@@ -1999,6 +2044,7 @@ namespace ZedColors
             bool pr = Has(s, "totalPremiumRequests");
             bool turn = f.WantText && (Has(s, "\"assistant.turn_") || Has(s, "\"tool.execution_start\"") || Has(s, "\"tool.execution_complete\"")
                         || Has(s, "\"subagent.completed\"")
+                        || Has(s, "\"session.task_complete\"")
                         || Has(s, "\"session.shutdown\"") || Has(s, "\"session.error\"") || Has(s, "abort"));
             if (!um && !am && !pr && !turn) return;
             Dictionary<string, object> d = Parse(s);
@@ -2032,28 +2078,35 @@ namespace ZedColors
             }
             else if (f.WantText && type != null)
             {
+                bool main = data == null || J.S(data, "parentToolCallId") == null;
                 // A turn ends when the agent's last message asked for no tools; stop/shutdown/error also end it.
-                if (type == "assistant.turn_start") { if (!f.Working) f.StartTurn(t); }
+                if (type == "assistant.turn_start") { if (main && !f.Working) f.StartTurn(t); }
                 else if (type == "tool.execution_start")
                 {
-                    if (!f.Working) f.StartTurn(t);
+                    if (main && !f.Working) f.StartTurn(t);
                     if (data != null) CopilotStep(f, data, t);
                 }
-                else if (type == "tool.execution_complete" && data != null) CopilotHelperResult(f, data);
+                else if (type == "tool.execution_complete" && data != null)
+                {
+                    CopilotHelperResult(f, data);
+                    if (f.Background == 0 && f.WaitingForBackground) f.EndTurn(t);
+                }
                 else if (type == "subagent.completed" && data != null)
                 {
                     f.BackgroundFinished(J.S(data, "toolCallId"));
-                    if (f.Background == 0) f.WaitingForBackground = false;
+                    if (f.Background == 0 && f.WaitingForBackground) f.EndTurn(t);
+                }
+                else if (type == "session.task_complete" && data != null && J.B(data, "success")
+                    && main)
+                {
+                    f.LastTools = 0;
+                    CopilotFinishTurn(f, t);
                 }
                 else if (type == "assistant.turn_end")
                 {
-                    if (f.LastTools == 0)
-                    {
-                        if (f.Background > 0) { f.Resume(t); f.WaitingForBackground = true; }
-                        else f.EndTurn(t);
-                    }
+                    if (f.LastTools == 0 && main) CopilotFinishTurn(f, t);
                 }
-                else if (type == "session.shutdown" || type == "session.error" || type.Contains("abort")) { if (f.Working) f.EndTurn(t); }
+                else if (main && (type == "session.shutdown" || type == "session.error" || type.Contains("abort"))) { if (f.Working) f.EndTurn(t); }
             }
             if (data != null && data.ContainsKey("totalPremiumRequests"))
             {
@@ -2065,6 +2118,13 @@ namespace ZedColors
                     f.PremiumMax = v;
                 }
             }
+        }
+
+        static void CopilotFinishTurn(FileScan f, DateTime t)
+        {
+            if (!f.Working) return;
+            if (f.Background > 0) { f.WaitingForBackground = true; }
+            else f.EndTurn(t);
         }
 
         static void CopilotHelperResult(FileScan f, Dictionary<string, object> data)
@@ -2938,10 +2998,11 @@ namespace ZedColors
     {
         public CiInfo Run;
         public string Message;
+        public DateTime CheckedUtc;
     }
 
     // Asks GitHub (through the gh command-line tool, already signed in) for the newest Actions run in
-    // the git repos of the open thread's project folders. Read-only; runs on its own background thread.
+    // the git repos of visible threads, plus the open/hovered thread. Read-only background work.
     public class CiWatcher
     {
         App host;
@@ -2949,6 +3010,7 @@ namespace ZedColors
         AutoResetEvent wake = new AutoResetEvent(false);
         volatile bool stop;
         volatile string folders;
+        volatile string[] visibleFolders = new string[0];
         Dictionary<string, CiSnapshot> snapshots = new Dictionary<string, CiSnapshot>();
         Dictionary<string, List<string>> repoCache = new Dictionary<string, List<string>>();
         DateTime repoCacheTime = DateTime.MinValue;
@@ -2975,6 +3037,18 @@ namespace ZedColors
             wake.Set();
         }
 
+        public void SetVisibleFolders(List<string> all)
+        {
+            List<string> unique = new List<string>();
+            foreach (string f in all) if (!string.IsNullOrEmpty(f) && !unique.Contains(f)) unique.Add(f);
+            string[] old = visibleFolders;
+            bool same = old.Length == unique.Count;
+            if (same) for (int i = 0; i < old.Length; i++) if (old[i] != unique[i]) { same = false; break; }
+            if (same) return;
+            visibleFolders = unique.ToArray();
+            wake.Set();
+        }
+
         public CiSnapshot SnapshotFor(string f)
         {
             if (string.IsNullOrEmpty(f)) return null;
@@ -2987,7 +3061,24 @@ namespace ZedColors
 
         void Publish(string f, CiSnapshot s)
         {
+            s.CheckedUtc = DateTime.UtcNow;
             lock (snapshots) snapshots[f] = s;
+            host.Post(host.OnCi);
+        }
+
+        List<string> DueFolders(DateTime now)
+        {
+            List<string> all = new List<string>(), due = new List<string>();
+            string priority = folders;
+            if (!string.IsNullOrEmpty(priority)) all.Add(priority);
+            foreach (string f in visibleFolders) if (!all.Contains(f)) all.Add(f);
+            foreach (string f in all)
+            {
+                CiSnapshot s = SnapshotFor(f);
+                double seconds = s != null && s.Run != null && s.Run.Running ? 8 : 45;
+                if (s == null || (now - s.CheckedUtc).TotalSeconds >= seconds) due.Add(f);
+            }
+            return due;
         }
 
         void Run()
@@ -2995,9 +3086,9 @@ namespace ZedColors
             wake.WaitOne(3000);
             while (!stop)
             {
-                string f = folders;
-                if (!string.IsNullOrEmpty(f))
+                foreach (string f in DueFolders(DateTime.UtcNow))
                 {
+                    if (stop) break;
                     try { Poll(f); }
                     catch (Exception ex)
                     {
@@ -3005,9 +3096,7 @@ namespace ZedColors
                         Publish(f, new CiSnapshot { Message = "GitHub status unavailable. Open log for details." });
                     }
                 }
-                CiSnapshot s = SnapshotFor(folders);
-                CiInfo c = s == null ? null : s.Run;
-                wake.WaitOne(c != null && c.Running ? 8000 : 45000); // faster while a run is going
+                wake.WaitOne(1000);
             }
         }
 
@@ -3026,10 +3115,18 @@ namespace ZedColors
             CiInfo best = null;
             foreach (string repo in repos)
             {
-                string json = Gh("run list -R " + repo + " --limit 1 --json databaseId,status,conclusion,workflowName,displayTitle,createdAt,updatedAt,headBranch,url");
+                string args = "run list -R " + repo + " --limit 1 --json databaseId,status,conclusion,workflowName,displayTitle,createdAt,updatedAt,headBranch,url";
+                string json = Gh(args + " --status in_progress");
                 if (json == null) { Publish(f, new CiSnapshot { Message = "GitHub status unavailable. Open log for details." }); return; }
                 object[] arr = Parse(json) as object[];
                 if (arr == null) throw new InvalidDataException("Unexpected GitHub Actions run list");
+                if (arr.Length == 0)
+                {
+                    json = Gh(args);
+                    if (json == null) { Publish(f, new CiSnapshot { Message = "GitHub status unavailable. Open log for details." }); return; }
+                    arr = Parse(json) as object[];
+                    if (arr == null) throw new InvalidDataException("Unexpected GitHub Actions run list");
+                }
                 if (arr.Length == 0) continue;
                 Dictionary<string, object> r = arr[0] as Dictionary<string, object>;
                 if (r == null) throw new InvalidDataException("Unexpected GitHub Actions run");
@@ -3059,7 +3156,9 @@ namespace ZedColors
                             }
                         }
                 }
-                if (best == null || c.Created > best.Created) best = c;
+                int priority = c.Status == "in_progress" ? 2 : c.Running ? 1 : 0;
+                int previous = best == null ? -1 : best.Status == "in_progress" ? 2 : best.Running ? 1 : 0;
+                if (priority > previous || (priority == previous && c.Created > best.Created)) best = c;
             }
             Publish(f, new CiSnapshot { Run = best, Message = best == null ? "No GitHub Actions runs found." : null });
         }
@@ -3568,7 +3667,6 @@ namespace ZedColors
         RingForm rings;
         MenuItem pauseItem, startupItem;
         Dictionary<string, int> colors = new Dictionary<string, int>();
-        Dictionary<string, string> aliases = new Dictionary<string, string>();
         List<Word> words = new List<Word>();
         string dir, dataPath, logPath, scriptPath, lastRowsSig = "";
         bool paused = false;
@@ -3578,6 +3676,7 @@ namespace ZedColors
         uint myPid;
         long lastHash = 0;
         float scale = 1f;
+        double subtitleExtentDip = 20;
         Rectangle sidebar = Rectangle.Empty;
         int[] lastPx; int lastCapW, lastCh;
 
@@ -3813,7 +3912,13 @@ namespace ZedColors
             words.Add(wd);
         }
 
-        public void EndOcr()
+        static bool SubtitleBelow(List<OLine> content, int i)
+        {
+            return i + 1 < content.Count && content[i + 1].IsSub
+                && content[i + 1].Top - content[i].Bottom < Math.Max(content[i].Height, 8) * 1.6;
+        }
+
+        List<Row> ReadRows()
         {
             // Group words into lines.
             SortedDictionary<int, List<Word>> byLine = new SortedDictionary<int, List<Word>>();
@@ -3857,6 +3962,12 @@ namespace ZedColors
 
             double headerLeft = double.MaxValue;
             foreach (OLine l in content) if (!l.IsSub) headerLeft = Math.Min(headerLeft, l.Left);
+            List<double> subtitleExtents = new List<double>();
+            for (int i = 0; i < content.Count; i++)
+                if (!content[i].IsSub && SubtitleBelow(content, i)) subtitleExtents.Add(content[i + 1].Bottom - content[i].Bottom);
+            subtitleExtents.Sort();
+            if (subtitleExtents.Count > 0) subtitleExtentDip = subtitleExtents[subtitleExtents.Count / 2] / Math.Max(1f, scale);
+            double subtitleExtent = (subtitleExtentDip > 0 ? subtitleExtentDip : 20) * scale;
 
             List<Row> rows = new List<Row>();
             string project = "";
@@ -3864,14 +3975,15 @@ namespace ZedColors
             {
                 OLine l = content[i];
                 if (l.IsSub) continue;
-                bool subBelow = i + 1 < content.Count && content[i + 1].IsSub
-                                && content[i + 1].Top - l.Bottom < Math.Max(l.Height, 8) * 1.6;
+                bool subBelow = SubtitleBelow(content, i);
                 bool indented = l.Left > headerLeft + 10 * scale;
                 if (indented || subBelow)
                 {
                     string title = Norm(l.Text);
                     if (title.Length < 3) continue; // stray icon or button read as text
-                    double bottom = subBelow ? content[i + 1].Bottom : l.Bottom;
+                    int ni = subBelow ? i + 2 : i + 1;
+                    double nextTop = ni < content.Count ? content[ni].Top : sidebar.Bottom;
+                    double bottom = subBelow ? content[i + 1].Bottom : Math.Max(l.Bottom, Math.Min(l.Bottom + subtitleExtent, nextTop - 4 * scale));
                     Row r = new Row();
                     r.Key = Norm(project) + "|" + title;
                     r.CenterY = (int)Math.Round((l.Top + bottom) / 2.0);
@@ -3879,8 +3991,6 @@ namespace ZedColors
                     // past halfway to the line above or below.
                     double pad = 9 * scale;
                     double prevBottom = i > 0 ? content[i - 1].Bottom : sidebar.Top;
-                    int ni = subBelow ? i + 2 : i + 1;
-                    double nextTop = ni < content.Count ? content[ni].Top : sidebar.Bottom;
                     r.RowTop = (int)Math.Round(Math.Max(l.Top - pad, (prevBottom + l.Top) / 2));
                     r.RowBottom = (int)Math.Round(Math.Min(bottom + pad, (bottom + nextTop) / 2));
                     r.Project = project;
@@ -3893,21 +4003,21 @@ namespace ZedColors
                 }
             }
 
-            // If OCR read only part of a title (e.g. "Build" for "Visio Build"), use the full
-            // title from Zed's list so the box keeps its color and the open thread stays put.
+            // Canonical database names keep OCR variants from changing color keys.
             LoadThreads();
             foreach (Row r in rows)
             {
                 ThreadInfo t = MatchThread(r.Project, r.Title);
                 if (t == null) continue;
-                string dn = Norm(t.Display), tn = Norm(r.Title);
-                if (dn.Length > tn.Length && dn.Contains(tn))
-                {
-                    r.Title = t.Display;
-                    r.Key = Norm(r.Project) + "|" + dn;
-                }
+                r.Title = t.Display;
+                r.Key = ColorKeyFor(t, Norm(r.Project));
             }
+            return rows;
+        }
 
+        public void EndOcr()
+        {
+            List<Row> rows = ReadRows();
             string sig = "";
             foreach (Row r in rows) sig += r.Key + ";";
             if (sig != lastRowsSig) { Log("threads seen: " + (sig.Length > 0 ? sig : "(none)")); lastRowsSig = sig; }
@@ -4019,9 +4129,11 @@ namespace ZedColors
         {
             string tn = Norm(title), pn = Norm(project ?? "");
             if (tn.Length == 0) return null;
-            ThreadInfo best = null; int bestScore = -1; string bestUpd = "";
+            ThreadInfo best = null; int bestScore = -1;
+            bool ambiguous = false;
             foreach (ThreadInfo t in threads)
             {
+                if (pn.Length > 0 && !InProject(t, pn)) continue;
                 string dn = Norm(t.Display);
                 if (dn.Length == 0) continue;
                 bool titleOk = dn == tn || Lev(dn, tn) <= Math.Max(1, tn.Length / 8)
@@ -4029,12 +4141,13 @@ namespace ZedColors
                 if (!titleOk) continue;
                 int score = dn == tn ? 2 : 1;
                 if (pn.Length > 0 && InProject(t, pn)) score += 2;
-                if (score > bestScore || (score == bestScore && string.CompareOrdinal(t.Updated, bestUpd) > 0))
+                if (score > bestScore)
                 {
-                    best = t; bestScore = score; bestUpd = t.Updated;
+                    best = t; bestScore = score; ambiguous = false;
                 }
+                else if (score == bestScore && best != null && t.Session != best.Session) ambiguous = true;
             }
-            if (best != null) return best;
+            if (best != null) return ambiguous ? null : best;
 
             // OCR sometimes drops a word next to a moving icon (e.g. "Visio Build" read as "Build").
             // Accept a partial title only if exactly one thread in that project contains it.
@@ -4052,12 +4165,42 @@ namespace ZedColors
 
         static bool InProject(ThreadInfo t, string pn)
         {
+            return MatchedProject(t, pn) != null;
+        }
+
+        static string MatchedProject(ThreadInfo t, string pn)
+        {
+            if (pn.Length == 0 || string.IsNullOrEmpty(t.Folders)) return null;
+            string best = null;
+            int distance = int.MaxValue;
+            bool ambiguous = false;
             foreach (string f in t.Folders.Split('\n'))
             {
                 string seg = Norm(Path.GetFileName(f.Trim().TrimEnd('\\', '/')) ?? "");
-                if (seg.Length > 0 && (seg == pn || Lev(seg, pn) <= 1 + pn.Length / 6)) return true;
+                if (seg.Length == 0) continue;
+                int d = Lev(seg, pn);
+                if (d <= 1 + pn.Length / 6 && d < distance) { best = seg; distance = d; ambiguous = false; }
+                else if (d == distance && seg != best) ambiguous = true;
             }
-            return false;
+            return ambiguous ? null : best;
+        }
+
+        string ColorKeyFor(ThreadInfo t, string project)
+        {
+            string title = Norm(t.Display);
+            string canonical = (MatchedProject(t, project) ?? project) + "|" + title;
+            if (colors == null || colors.ContainsKey(canonical)) return canonical;
+            string legacy = null;
+            foreach (string key in colors.Keys)
+            {
+                int separator = key.IndexOf('|');
+                if (separator < 0 || key.Substring(separator + 1) != title) continue;
+                ThreadInfo matched = MatchThread(key.Substring(0, separator), t.Display);
+                if (matched == null || matched.Session != t.Session) continue;
+                if (legacy != null) return canonical;
+                legacy = key;
+            }
+            return legacy ?? canonical;
         }
 
         // ---------- Thread search + usage meter (v3.0) ----------
@@ -4084,6 +4227,8 @@ namespace ZedColors
             UpdateNeeds();
             if (usageForm != null && !usageForm.IsDisposed && usageForm.Visible) usageForm.SetLines(UsageLines());
         }
+
+        public void OnCi() { UpdateDots(); }
 
         float WindowScale() { return zedMain != IntPtr.Zero ? scale : Native.ScaleFor(IntPtr.Zero); }
         IntPtr OwnerForPopups() { return zedMain != IntPtr.Zero && Native.IsWindow(zedMain) ? zedMain : IntPtr.Zero; }
@@ -4480,11 +4625,22 @@ namespace ZedColors
         {
             Dictionary<string, int> d = new Dictionary<string, int>();
             Dictionary<string, int> helpers = new Dictionary<string, int>();
+            Dictionary<string, int> progress = new Dictionary<string, int>();
+            List<string> visible = new List<string>();
             DateTime now = DateTime.Now;
             foreach (Row r in form.Rows)
             {
                 ThreadInfo t = MatchThread(r.Project, r.Title);
                 if (t == null) continue;
+                if (ci != null)
+                {
+                    visible.Add(t.Folders);
+                    CiSnapshot snapshot = ci.SnapshotFor(t.Folders);
+                    CiInfo run = snapshot == null ? null : snapshot.Run;
+                    if (run != null && run.Running)
+                        progress[r.Key] = run.Status == "in_progress" && run.StepsTotal > 0
+                            ? Math.Max(0, Math.Min(100, run.Percent)) : -1;
+                }
                 ThreadUsage tu = UsageFor(t.Session);
                 if (tu == null || !tu.HasTurn) continue;
 
@@ -4498,11 +4654,14 @@ namespace ZedColors
                 }
                 if (tu.Working && !stale && tu.ActiveHelpers > 0 && d.ContainsKey(r.Key)) helpers[r.Key] = tu.ActiveHelpers;
             }
+            if (ci != null) ci.SetVisibleFolders(visible);
             bool same = d.Count == rings.Dots.Count;
             if (same) foreach (KeyValuePair<string, int> kv in d) { int v; if (!rings.Dots.TryGetValue(kv.Key, out v) || v != kv.Value) { same = false; break; } }
             if (same) same = helpers.Count == rings.ActiveHelpers.Count;
             if (same) foreach (KeyValuePair<string, int> kv in helpers) { int v; if (!rings.ActiveHelpers.TryGetValue(kv.Key, out v) || v != kv.Value) { same = false; break; } }
-            if (!same) { rings.Dots = d; rings.ActiveHelpers = helpers; rings.Invalidate(); }
+            if (same) same = progress.Count == rings.GitHubProgress.Count;
+            if (same) foreach (KeyValuePair<string, int> kv in progress) { int v; if (!rings.GitHubProgress.TryGetValue(kv.Key, out v) || v != kv.Value) { same = false; break; } }
+            if (!same) { rings.Dots = d; rings.ActiveHelpers = helpers; rings.GitHubProgress = progress; rings.Invalidate(); }
         }
 
         Row RowForHover(Point p)
@@ -4566,7 +4725,7 @@ namespace ZedColors
             List<ULine> l = new List<ULine>();
             ThreadInfo t = MatchThread(r.Project, r.Title);
             l.Add(new ULine(t != null ? t.Display : r.Title, Theme.Fg, true));
-            if (t == null) { l.Add(new ULine("Not in Zed's thread list yet.", Theme.Dim, false)); return l; }
+            if (t == null) { l.Add(new ULine("Could not uniquely match this title and project to a saved session.", Theme.Dim, false)); return l; }
 
             ThreadDoc doc = null;
             IndexSnapshot ix = IndexSnap;
@@ -4633,17 +4792,14 @@ namespace ZedColors
 
         public int ColorIndex(string key)
         {
-            string k = Resolve(key);
             int idx;
-            if (k != null && colors.TryGetValue(k, out idx)) return idx;
+            if (colors.TryGetValue(key, out idx)) return idx;
             return 0;
         }
 
         public void SetColor(string key, int idx)
         {
-            string k = Resolve(key) ?? key;
-            if (idx <= 0 || idx >= Palette.Length) colors.Remove(k); else colors[k] = idx;
-            aliases.Clear();
+            if (idx <= 0 || idx >= Palette.Length) colors.Remove(key); else colors[key] = idx;
             Save();
             form.Invalidate();
         }
@@ -4660,30 +4816,11 @@ namespace ZedColors
             catch (Exception ex) { Log("color picker error: " + ex.Message); }
         }
 
-        // Tolerate small OCR misreads (e.g. "Visio BuiId" vs "Visio Build").
-        string Resolve(string key)
-        {
-            if (colors.ContainsKey(key)) return key;
-            string a;
-            if (aliases.TryGetValue(key, out a)) return a;
-            string best = null;
-            int bestD = int.MaxValue;
-            int allowed = Math.Max(1, key.Length / 8);
-            foreach (string k in colors.Keys)
-            {
-                if (Math.Abs(k.Length - key.Length) > allowed) continue;
-                int d = Lev(k, key);
-                if (d <= allowed && d < bestD) { bestD = d; best = k; }
-            }
-            aliases[key] = best;
-            return best;
-        }
-
         void ClearAll()
         {
             if (MessageBox.Show("Remove the color from every thread?", "Zed Thread Colors", MessageBoxButtons.YesNo) == DialogResult.Yes)
             {
-                colors.Clear(); aliases.Clear(); Save(); form.Invalidate();
+                colors.Clear(); Save(); form.Invalidate();
             }
         }
 
